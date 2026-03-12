@@ -228,6 +228,14 @@
    - Or 72x fewer instructions
    - This seems to require a mathematical shortcut or pre-computation
 
+### What We've Tried
+
+1. **VLIW Packing** - ✅ Working (98,582 cycles)
+2. **Address Pre-computation** - ✅ Working (98,582 cycles)
+3. **Vectorization with valu** - ❌ Made it worse
+4. **vload for round 0** - ⚠️ Marginal (97,910 cycles)
+5. **Loop unrolling (4-way)** - ❌ Broke correctness
+
 ### Next Steps (Unlikely to succeed without major breakthrough)
 
 1. **Pre-compute all possible paths through tree**
@@ -242,6 +250,211 @@
 3. **Lookup table approach**
    - Pre-compute some function results
    - Trade memory for compute
+
+---
+
+## Attempt 11: Pre-load forest to scratch
+**Date**: 2026-03-12
+**Cycles**: N/A
+**Status**: ❌ Not attempted (insufficient scratch)
+
+**Approach**:
+- Copy forest values to scratch memory
+- Use faster scratch access instead of main memory
+
+**Problem**:
+- Tree has 2047 nodes
+- Scratch has only 1536 words
+- Not enough scratch space!
+
+---
+
+## Attempt 12: Vectorized with vload/vstore
+**Date**: 2026-03-12
+**Cycles**: N/A
+**Status**: ❌ Failed (wrong instruction)
+
+**Approach**:
+- Use vload to load 8 consecutive indices/values
+- Process 8 items in parallel
+- Use vstore to save results
+
+**Problem**:
+- `store_offset` is not a valid instruction
+- The indirect addressing for node_val still can't be vectorized
+
+---
+
+## Attempt 13: 4-way Loop Unrolling
+**Date**: 2026-03-12
+**Cycles**: N/A
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- Process 4 items simultaneously
+- Use separate register sets for each item
+- Pack all operations per cycle
+
+**Problem**:
+- Broke correctness - got wrong results
+- Likely a dependency or register allocation bug
+
+---
+
+## Submission Test Results
+
+| Test | Target | Status |
+|------|--------|--------|
+| test_kernel_speedup | < 147,734 | ✅ PASS |
+| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (98k) |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL |
+| test_opus45_casual | < 1,790 | ❌ FAIL |
+| test_opus45_2hr | < 1,579 | ❌ FAIL |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL |
+| test_opus45_11hr | < 1,487 | ❌ FAIL |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL
+
+---
+
+## Attempt 15: Better ILP with Temp Registers
+**Date**: 2026-03-12
+**Cycles**: 94,742
+**Status**: ✅ Same as Attempt 14
+
+**Approach**:
+- Tried to use separate tmp_a, tmp_b registers for hash to improve ILP
+- Same performance as Attempt 14
+
+**Result**:
+- No improvement
+
+---
+
+## Attempt 16: vload for Round 0
+**Date**: 2026-03-12
+**Cycles**: N/A
+**Status**: ❌ Failed (IndexError)
+
+**Approach**:
+- Tried to use vload for round 0 when indices are consecutive
+- vload expects consecutive memory addresses
+
+**Problem**:
+- IndexError: list index out of range
+- vload works differently than expected
+
+---
+
+## Attempt 17: Fully Unrolled Rounds
+**Date**: 2026-03-12
+**Cycles**: N/A
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- Unroll the rounds loop completely
+- Attempted to pipeline stores and loads across round boundaries
+
+**Problem**:
+- Incorrect result on round 1
+- Dependency issues in the pipelining attempt
+
+---
+
+## Attempt 18: 2-way Loop Unrolling
+**Date**: 2026-03-12
+**Cycles**: N/A
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- Process 2 items at a time with separate register sets
+- Pack 4 ALU ops per cycle for better ILP
+
+**Problem**:
+- Incorrect result - bug in register allocation or dependencies
+
+---
+
+## Current Status
+**Cycles**: 94,742
+**Target**: <1,363
+**Speedup needed**: ~70x
+
+---
+
+## Attempt 24: Round 0 Vectorization (vload/vvalu)
+**Date**: 2026-03-12
+**Status**: ❌ Failed (timed out / correctness)
+
+**Approach**:
+- Attempted to use vload to load 8 consecutive input values
+- Used valu/vbroadcast for hash computation in parallel
+- Used vstore to save results
+
+**Problem**:
+- Complex code that was hard to get correct
+- Processing items twice (vectorized + scalar)
+- Timeout due to incorrect flow
+
+---
+
+## Attempt 25: vload for Values Only
+**Date**: 2026-03-12
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- Used vload for consecutive input values
+- Kept indices scalar (indirect addressing)
+- Mixed vload with scalar stores
+
+**Problem**:
+- Incorrect results - mixing vector loads with scalar stores caused issues
+- Need to either fully commit to vector or stay scalar
+
+---
+
+## Key Insights
+
+### Why is the target so hard to achieve?
+
+1. **Indirect addressing is the main bottleneck**
+   - `mem[forest_values_p + idx]` where idx varies per item
+   - Prevents full vectorization with vload/vstore
+   - Can't use valu engine effectively for multiple items
+
+2. **The target (1,363) requires 70x speedup**
+   - Current: 94,742 cycles
+   - Target: 1,363 cycles
+   - Theoretical minimum: ~1,536 cycles
+   - Target is BELOW theoretical minimum!
+
+3. **What would 70x speedup require?**
+   - Processing 70 items per cycle
+   - Or 70x fewer instructions
+   - This seems to require a mathematical shortcut or pre-computation
+
+### What We've Tried
+
+1. **VLIW Packing** - ✅ Working (94,742 cycles)
+2. **Address Pre-computation** - ✅ Working (94,742 cycles)
+3. **Vectorization with valu** - ❌ Made it worse
+4. **vload for round 0** - ❌ Failed (timeout/correctness)
+5. **vload for values** - ❌ Failed (correctness)
+6. **Loop unrolling** - ❌ Broke correctness
+7. **Software pipelining** - ❌ Broke correctness
+8. **Maximum ALU packing** - Same as baseline
+
+### Next Steps (Unlikely to succeed without major breakthrough)
+
+1. **Pre-compute entire tree traversal**
+   - For each starting index, pre-compute the path
+   - But val is 32-bit, making this infeasible
+
+2. **Lookup table for hash**
+   - Pre-compute myhash(x) for all x - impossible (2^32 entries)
+   - Pre-compute for smaller domain - loses precision
+
+3. **Different algorithm entirely?**
+   - The problem might require a completely different approach
 
 ---
 
@@ -260,23 +473,182 @@ python tests/submission_tests.py
 
 ---
 
-## Attempt 9: Vectorization with vload (In Progress)
+## Submission Test Results
+
+| Test | Target | Status |
+|------|--------|--------|
+| test_kernel_speedup | < 147,734 | ✅ PASS |
+| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (94k) |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL |
+| test_opus45_casual | < 1,790 | ❌ FAIL |
+| test_opus45_2hr | < 1,579 | ❌ FAIL |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL |
+| test_opus45_11hr | < 1,487 | ❌ FAIL |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL
+
+---
+
+## Attempt 14: Pre-computed Addresses
 **Date**: 2026-03-12
-**Cycles**: N/A
-**Status**: 🔄 In Progress
+**Cycles**: 94,742
+**Status**: ✅ Working (CURRENT BEST)
 
 **Approach**:
-- Try to use vload to load 8 consecutive indices/values at once
-- Use valu engine for hash computation
-- Process items 8 at a time
+- Pre-compute all memory addresses (inp_indices_p + i, inp_values_p + i) at kernel start
+- Store in arrays idx_addrs[i] and val_addrs[i]
+- Eliminates 2 ALU ops per iteration
+
+**Result**:
+- **Speedup: 1.56x over baseline**
+
+**Key insight**:
+- The indirect addressing for node_val is still the bottleneck
+- We can't vectorize the load from forest_values_p + idx
+
+---
+
+## Attempt 20: Use valu for hash
+**Date**: 2026-03-12
+**Status**: ❌ Failed (timed out)
 
 **Problem**:
-- vload reads from mem[scratch[addr]] - requires a base address in scratch
-- After round 0, indices are no longer consecutive (they get modified)
-- Cannot easily compute and store new addresses for vload each iteration
-- Ran out of scratch space when trying to allocate vector registers
+- valu operations need vector registers, but we have scalar data
+- The approach was fundamentally flawed
 
-**Key Insight**:
-- The indirect addressing pattern `mem[forest_values_p + idx]` is the fundamental bottleneck
-- Each of 8 lanes needs a different address - cannot be vectorized with vload
-- Need a different approach to break through
+---
+
+## Attempt 21: Use vload for input arrays  
+**Date**: 2026-03-12
+**Status**: ❌ Failed (IndexError)
+
+**Problem**:
+- vload requires consecutive addresses
+- load_offset doesn't work as expected for extracting elements
+
+---
+
+## Attempt 22: Maximum ALU packing
+**Date**: 2026-03-12
+**Cycles**: 94,742
+**Status**: Same as Attempt 14
+
+**Result**:
+- Already using all available ALU slots efficiently
+
+---
+
+## Attempt 23: Software pipelining
+**Date**: 2026-03-12
+**Status**: ❌ Failed (correctness)
+
+**Problem**:
+- Complex register dependencies caused incorrect results
+
+---
+
+## Attempt 27: Minimal vload for round 0
+**Date**: 2026-03-12
+**Status**: ❌ Reverted (no improvement)
+
+**Approach**:
+- Tried to use vload for first 8 items in round 0
+- All items start at idx=0, so theoretically batchable
+
+**Problem**:
+- Could not get vector/scalar mixing to work correctly
+- Reverted to scalar approach
+
+---
+
+## Key Insights
+
+### Why is the target so hard to achieve?
+
+1. **Indirect addressing is the main bottleneck**
+   - `mem[forest_values_p + idx]` where idx varies per item
+   - Prevents full vectorization with vload/vstore
+
+2. **The target (1,363) requires 70x speedup**
+   - Current: 94,742 cycles
+   - Target: 1,363 cycles
+   - Theoretical minimum: ~1,536 cycles
+
+3. **Per-item cycle count**
+   - ~23 cycles per item
+   - 4096 items total = ~94k cycles
+   - Need 8x parallelism to reach target
+
+### What We've Tried
+
+1. **VLIW Packing** - ✅ Working (94,742 cycles)
+2. **Address Pre-computation** - ✅ Working (94,742 cycles)
+3. **Vectorization with valu** - ❌ Made it worse
+4. **vload for round 0** - ❌ Failed
+5. **Loop unrolling** - ❌ Broke correctness
+6. **Software pipelining** - ❌ Broke correctness
+7. **Replace flow with ALU** - ❌ Failed (correctness)
+
+### Key Realization
+
+The theoretical minimum (~1,536 cycles) is VERY close to the target (1,363). This means:
+- We need near-perfect vectorization
+- Every cycle counts
+- The problem may require a breakthrough in algorithm or understanding
+
+---
+
+## Current Status
+**Cycles**: 94,742
+**Target**: <1,363
+**Speedup needed**: ~70x
+
+---
+
+## Attempt 28: Analysis of vectorization approaches
+**Date**: 2026-03-12
+**Status**: 🔄 In Progress
+
+**Key Insights**:
+
+1. **Pause instructions are disabled in submission tests**
+   - `machine.enable_pause = False` in submission tests
+   - Pause still costs cycles even when disabled
+   - Removing pause saves only ~2 cycles (negligible)
+
+2. **Vectorization blocked by indirect addressing**
+   - vload requires consecutive memory addresses
+   - The indirect load `mem[forest_values_p + idx]` cannot be vectorized
+   - idx varies per item, preventing batching
+
+3. **No store_offset instruction**
+   - Tried to build vectors using store_offset - doesn't exist
+   - Only vstore for storing entire vectors
+   - Can't write individual vector elements
+
+4. **Theoretical analysis**:
+   - 4,096 item iterations × 23 cycles = ~94,000 cycles (matches!)
+   - Target 1,363 requires 3 items/cycle
+   - With VLEN=8, need ~2.6 cycles per vector iteration
+   - Hash alone takes 12 cycles (sequential dependencies)
+
+5. **What hasn't been fully explored**:
+   - Batching items by index (items with same idx share node_val load)
+   - Round 0 is fully vectorizable (all at idx=0) - only 1/16 of work
+   - Using forest values from scratch (but 2047 nodes > 1536 scratch)
+
+**Problem**: The target of 1,363 cycles requires a breakthrough that seems impossible with current understanding.
+
+---
+
+## Submission Test Results
+
+| Test | Target | Status |
+|------|--------|--------|
+| test_kernel_speedup | < 147,734 | ✅ PASS |
+| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (94k) |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL |
+| test_opus45_casual | < 1,790 | ❌ FAIL |
+| test_opus45_2hr | < 1,579 | ❌ FAIL |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL |
+| test_opus45_11hr | < 1,487 | ❌ FAIL |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL |

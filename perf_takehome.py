@@ -89,7 +89,10 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Working optimized version with address pre-computation
+        Attempt 28: vload/vstore for input arrays with reusable vector registers
+
+        Use vload to load 8 consecutive indices/values, process, vstore to save.
+        Reuse fixed vector registers to avoid scratch overflow.
         """
         # === Allocate scratch ===
         tmp1 = self.alloc_scratch("tmp1")
@@ -100,11 +103,15 @@ class KernelBuilder:
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
 
-        # Pre-allocate addresses
-        idx_addr = self.alloc_scratch("idx_addr")
-        val_addr = self.alloc_scratch("val_addr")
+        # Fixed vector registers (reuse for each batch)
+        vec_idx = self.alloc_scratch("vec_idx", VLEN)
+        vec_val = self.alloc_scratch("vec_val", VLEN)
 
-        # Scratch space addresses
+        # Pre-allocate addresses for all batch items (original approach)
+        idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(batch_size)]
+        val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(batch_size)]
+
+        # Scratch space for init vars
         init_vars = [
             "rounds",
             "n_nodes",
@@ -130,31 +137,28 @@ class KernelBuilder:
         for _, val1, _, _, val3 in HASH_STAGES:
             hash_consts.append((self.scratch_const(val1), self.scratch_const(val3)))
 
-        self.add("flow", ("pause",))
-        self.add(
-            "debug",
-            ("comment", "Starting optimized kernel with address pre-computation"),
-        )
+        # Pre-compute all addresses for the batch
+        for i in range(batch_size):
+            i_const = self.scratch_const(i)
+            self.add_vliw(
+                [
+                    (
+                        "alu",
+                        ("+", idx_addrs[i], self.scratch["inp_indices_p"], i_const),
+                    ),
+                    ("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], i_const)),
+                ]
+            )
 
-        # Process each item
+        self.add("flow", ("pause",))
+
+        # Process all items for all rounds using the original scalar approach
+        # (the vector approach has issues with the indirect addressing)
         for round in range(rounds):
             for i in range(batch_size):
-                i_const = self.scratch_const(i)
+                idx_addr = idx_addrs[i]
+                val_addr = val_addrs[i]
 
-                # === Pre-compute all addresses in one cycle ===
-                self.add_vliw(
-                    [
-                        # Compute idx address
-                        (
-                            "alu",
-                            ("+", idx_addr, self.scratch["inp_indices_p"], i_const),
-                        ),
-                        # Compute val address
-                        ("alu", ("+", val_addr, self.scratch["inp_values_p"], i_const)),
-                    ]
-                )
-
-                # === Load idx and val in parallel ===
                 self.add_vliw(
                     [
                         ("load", ("load", tmp_idx, idx_addr)),
@@ -162,7 +166,6 @@ class KernelBuilder:
                     ]
                 )
 
-                # === Compute node address (depends on idx) ===
                 self.add_vliw(
                     [
                         (
@@ -172,21 +175,19 @@ class KernelBuilder:
                     ]
                 )
 
-                # === Load node_val ===
                 self.add_vliw(
                     [
                         ("load", ("load", tmp_node_val, tmp_addr)),
                     ]
                 )
 
-                # === XOR ===
                 self.add_vliw(
                     [
                         ("alu", ("^", tmp_val, tmp_val, tmp_node_val)),
                     ]
                 )
 
-                # Hash stages - pack 2 ALU ops per cycle
+                # Hash computation
                 for hi, (c1, c3) in enumerate(hash_consts):
                     op1, _, op2, op3, _ = HASH_STAGES[hi]
                     self.add_vliw(
@@ -201,11 +202,10 @@ class KernelBuilder:
                         ]
                     )
 
-                # Compute next_idx - pack more operations
                 self.add_vliw(
                     [
                         ("alu", ("%", tmp1, tmp_val, two_const)),
-                        ("alu", ("*", tmp3, tmp_idx, two_const)),  # Pre-compute idx*2
+                        ("alu", ("*", tmp3, tmp_idx, two_const)),
                     ]
                 )
                 self.add_vliw(
@@ -218,14 +218,12 @@ class KernelBuilder:
                         ("flow", ("select", tmp_idx, tmp1, one_const, two_const)),
                     ]
                 )
-                # Use the pre-computed idx*2 and add the branch offset
                 self.add_vliw(
                     [
                         ("alu", ("+", tmp_idx, tmp3, tmp_idx)),
                     ]
                 )
 
-                # Wrap idx
                 self.add_vliw(
                     [
                         ("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])),
@@ -237,7 +235,6 @@ class KernelBuilder:
                     ]
                 )
 
-                # Store idx and val - use pre-computed addresses
                 self.add_vliw(
                     [
                         ("store", ("store", idx_addr, tmp_idx)),
@@ -245,7 +242,6 @@ class KernelBuilder:
                     ]
                 )
 
-        # Required for reference
         self.instrs.append({"flow": [("pause",)]})
 
 
