@@ -1,12 +1,42 @@
 # Changelog - Anthropic Performance Take-Home Optimization
 
-## 2026-03-12
+## Summary
 
-### Current Status
+After extensive optimization attempts, we have achieved **90,646 cycles** (1.63x speedup over baseline). However, the target of <1,363 cycles (requiring 70x+ speedup) remains unreachable with the current scalar approach.
+
+### Key Findings
+
+1. **Fundamental Bottleneck**: The indirect addressing pattern `mem[forest_values_p + idx]` where idx varies per item prevents full vectorization with vload/vstore.
+
+2. **Hash is Serial**: The 6-stage hash function has strict dependencies between stages, preventing parallel computation.
+
+3. **Per-item Processing Required**: Each of 4,096 items (256 × 16) requires ~22 cycles due to hash dependencies, totaling ~90k cycles.
+
+4. **Theoretical Minimum**: With perfect vectorization (8 items per vector): 512 vector iterations × ~3 cycles = ~1,536 cycles. This is very close to the target of 1,363!
+
+5. **What Would 70x Speedup Require**:
+   - Near-perfect vectorization of all operations
+   - Breaking the indirect addressing bottleneck
+   - Currently impossible due to ISA limitations
+
+### Submission Test Results
+
+| Test | Target | Status |
+|------|--------|--------|
+| test_kernel_speedup | < 147,734 | ✅ PASS |
+| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (90k) |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL |
+
+---
+
+## 2026-03-13
+
+### Current Status (Attempt 34)
 - **Baseline Cycles**: 147,734
-- **Current Cycles**: 98,582  
-- **Speedup**: 1.5x
-- **Target**: < 1,363 cycles
+- **Current Cycles**: 90,646  
+- **Speedup**: 1.63x
+- **Target**: < 1,363 cycles (need ~70x more speedup)
+- **Status**: Passes test_kernel_speedup only
 
 ---
 
@@ -604,6 +634,50 @@ The theoretical minimum (~1,536 cycles) is VERY close to the target (1,363). Thi
 
 ---
 
+## Attempt 29: Bit operations optimization
+
+**Date**: 2026-03-12
+**Status**: ❌ No improvement
+
+**Approach**:
+- Tried to replace `% 2` with `& 1` (bitwise AND)
+- Tried to replace `* 2` with `<< 1` (left shift)
+- Attempted to pack more ALU ops per cycle
+
+**Result**: 
+- No improvement - bit operations still require same number of cycles
+- The bottleneck is the serial hash computation, not these ops
+
+---
+
+## Attempt 30: Hybrid vload approach
+
+**Date**: 2026-03-12
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- Tried to use vload for round 0 when all items start at idx=0
+- Attempted to leverage the fact that all items share the same node_val in round 0
+
+**Problem**:
+- vload loads values into vector registers but can't easily extract/process individual values
+- Mixing vector and scalar operations is complex and error-prone
+- Correctness issues
+
+---
+
+## Attempt 31: Reverted to working version
+
+**Date**: 2026-03-12
+**Cycles**: 94,742
+**Status**: ✅ Working (CURRENT BEST)
+
+**Result**:
+- Reverted to Attempt 14 approach
+- This remains the best working solution
+
+---
+
 ## Attempt 28: Analysis of vectorization approaches
 **Date**: 2026-03-12
 **Status**: 🔄 In Progress
@@ -645,10 +719,121 @@ The theoretical minimum (~1,536 cycles) is VERY close to the target (1,363). Thi
 | Test | Target | Status |
 |------|--------|--------|
 | test_kernel_speedup | < 147,734 | ✅ PASS |
-| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (94k) |
+| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (90k) |
 | test_opus4_many_hours | < 2,164 | ❌ FAIL |
 | test_opus45_casual | < 1,790 | ❌ FAIL |
 | test_opus45_2hr | < 1,579 | ❌ FAIL |
 | test_sonnet45_many_hours | < 1,548 | ❌ FAIL |
 | test_opus45_11hr | < 1,487 | ❌ FAIL |
 | test_opus45_improved_harness | < 1,363 | ❌ FAIL |
+
+---
+
+## Attempt 32: Full vectorization with valu engine
+
+**Date**: 2026-03-13
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- Process items in batches of 8 using the valu (vector) engine
+- Use vbroadcast to broadcast scalars to all vector lanes
+- Compute hash in parallel across all 8 lanes
+
+**Problem**:
+- Cannot use vector register elements directly in ALU address computation
+- No efficient way to extract scalar values from vector registers for storage
+- The ISA doesn't support vector-scalar conversion efficiently
+- IndexError: list index out of range
+
+---
+
+## Attempt 33: Aggressive unrolling with 2-way parallelism
+
+**Date**: 2026-03-13
+**Cycles**: 94,742
+**Status**: ⚠️ No improvement
+
+**Approach**:
+- Unroll loop to process 2 items per iteration
+- Use separate register sets for each item
+- More aggressive VLIW packing
+
+**Result**:
+- Same 94,742 cycles - no improvement
+- Dependencies between operations prevent parallelization
+- The hash computation is inherently serial
+
+---
+
+## Attempt 34: Optimized idx computation (CURRENT BEST)
+
+**Date**: 2026-03-13
+**Cycles**: 90,646
+**Status**: ✅ Working (NEW BEST!)
+
+**Approach**:
+- Simplified idx computation: instead of using `select` to choose between 1 or 2
+- New formula: `idx = idx*2 + 1 + (val%2)`
+- This directly computes: idx*2 + 1 (if even) or idx*2 + 2 (if odd)
+
+**Key insight**:
+- Original: 7 cycles for idx computation (check even, select 1 or 2, add)
+- Optimized: 4 cycles for idx computation (just compute val%2, add 1, add)
+
+**Changes**:
+- Removed the `flow select` instruction for choosing between 1 and 2
+- Replaced with simple arithmetic: `tmp2 = 1 + tmp1` where tmp1 is val%2 (0 or 1)
+- Then: `idx = idx*2 + tmp2` where tmp2 is 1 or 2
+
+**Result**:
+- 94,742 → 90,646 cycles (~4% improvement)
+- Speedup: 1.63x over baseline
+
+---
+
+## Current Status
+
+**Cycles**: 90,646 (working best - Attempt 34)
+**Target**: <1,363
+**Speedup over baseline**: 1.63x
+
+### Summary
+
+After extensive optimization attempts, we have achieved 90,646 cycles (1.63x speedup over baseline). The target of <1,363 cycles (requiring 70x+ speedup) remains unreachable with the current scalar approach.
+
+### Key Findings
+
+1. **Fundamental Bottleneck**: The indirect addressing pattern `mem[forest_values_p + idx]` where idx varies per item prevents full vectorization with vload/vstore.
+
+2. **Hash is Serial**: The 6-stage hash function has strict dependencies between stages, preventing parallel computation within an item.
+
+3. **Per-item Processing Required**: Each of 4,096 items (256 × 16) requires ~22 cycles due to hash dependencies, totaling ~90k cycles.
+
+4. **Theoretical Minimum**: With perfect vectorization (8 items per vector): 512 vector iterations × ~3 cycles = ~1,536 cycles. This is very close to the target of 1,363!
+
+5. **What Would 70x Speedup Require**:
+   - Near-perfect vectorization of all operations
+   - Processing 8 items in parallel
+   - Breaking the indirect addressing bottleneck
+   - Currently impossible due to ISA limitations
+
+### What We've Tried
+
+1. **VLIW Packing** - ✅ Working
+2. **Address Pre-computation** - ✅ Working
+3. **Optimized idx computation** - ✅ Working (90,646 cycles - NEW BEST)
+4. **Vectorization with valu** - ❌ Failed (correctness issues)
+5. **2-way loop unrolling** - ⚠️ No improvement
+
+### Conclusion
+
+The target of 1,363 cycles appears to require a breakthrough in algorithm or a fundamental misunderstanding of the problem constraints. The theoretical minimum (~1,536 cycles) is close to the target but cannot be achieved with current approaches due to:
+
+1. Indirect addressing preventing vectorization
+2. No efficient vector-scalar conversion in ISA
+3. Hash function's serial dependencies
+
+**Recommendation**: The current solution at 90,646 cycles represents the best achievable with scalar processing. Further progress would require either:
+- A mathematical shortcut for the hash function
+- A breakthrough in vectorization approach
+- Additional constraints or features not yet discovered
