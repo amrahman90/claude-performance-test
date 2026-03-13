@@ -116,27 +116,37 @@ class KernelBuilder:
         # Temporary addresses for node lookups
         tmp_addrs = [self.alloc_scratch(f"tmp_addr_{i}") for i in range(VLEN)]
 
-        # Scratch space for init vars
+        # OPTIMIZATION: Only load the 3 pointers we actually need from memory
+        # We don't need: rounds, n_nodes, batch_size, forest_height
+        # (rounds is used for loop count which we unroll, n_nodes is passed as param)
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "forest_values_p",  # mem[4]
+            "inp_indices_p",  # mem[5]
+            "inp_values_p",  # mem[6]
         ]
+        # Allocate space but don't load yet - we'll load directly from memory addresses
         for v in init_vars:
             self.alloc_scratch(v, 1)
+
+        # Load only the 3 pointers we need (6 cycles instead of 14)
+        # Memory layout: [rounds, n_nodes, batch_size, forest_height, fv_p, idx_p, val_p, ...]
+        # So forest_values_p is at mem[4], etc.
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
+            mem_addr = 4 + i  # forest_values_p=4, inp_indices_p=5, inp_values_p=6
+            self.add("load", ("const", tmp1, mem_addr))
             self.add("load", ("load", self.scratch[v], tmp1))
 
         # Pre-load constants
         zero_const = self.scratch_const(0)
 
         # Pre-compute hash constants using VBROADCAST
+        # For stages 0, 2, 4: we can use multiply_add to combine 2 ops into 1
+        # Stage 0: (val + c1) + (val << 12) = val * 4097 + c1
+        # Stage 2: (val + c1) + (val << 5) = val * 33 + c1
+        # Stage 4: (val + c1) + (val << 3) = val * 9 + c1
         hash_consts_valu = []
+        mul_constants = {0: 4097, 2: 33, 4: 9}  # Stages where op2 is "+"
+
         for stage_idx, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
             const1_scalar = self.scratch_const(val1)
             const3_scalar = self.scratch_const(val3)
@@ -144,7 +154,16 @@ class KernelBuilder:
             const3_base = self.alloc_scratch(f"hc3_{stage_idx}", VLEN)
             self.add("valu", ("vbroadcast", const1_base, const1_scalar))
             self.add("valu", ("vbroadcast", const3_base, const3_scalar))
-            hash_consts_valu.append((const1_base, const3_base))
+
+            # Pre-compute multiply constant if applicable
+            if stage_idx in mul_constants:
+                mul_val = mul_constants[stage_idx]
+                mul_scalar = self.scratch_const(mul_val)
+                mul_base = self.alloc_scratch(f"mul_{stage_idx}", VLEN)
+                self.add("valu", ("vbroadcast", mul_base, mul_scalar))
+                hash_consts_valu.append((const1_base, const3_base, mul_base, True))
+            else:
+                hash_consts_valu.append((const1_base, const3_base, None, False))
 
         # Pre-allocate shift constant vector
         shift_const_base = self.alloc_scratch("shift_const", VLEN)
@@ -194,16 +213,25 @@ class KernelBuilder:
             # XOR
             self.add("valu", ("^", vec_val, vec_val, vec_node_val))
 
-            # Hash computation
-            for stage_idx, (c1_base, c3_base) in enumerate(hash_consts_valu):
+            # Hash computation - use multiply_add for stages 0, 2, 4
+            for stage_idx, (c1_base, c3_base, mul_base, use_mul) in enumerate(
+                hash_consts_valu
+            ):
                 op1, _, op2, op3, _ = HASH_STAGES[stage_idx]
-                self.add_vliw(
-                    [
-                        ("valu", (op1, vec_tmp1, vec_val, c1_base)),
-                        ("valu", (op3, vec_tmp2, vec_val, c3_base)),
-                    ]
-                )
-                self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
+                if use_mul:
+                    # multiply_add: dest = (a * b + c) mod 2^32
+                    # For stages 0, 2, 4: (val + c1) + (val << shift) = val * mul_const + c1
+                    self.add(
+                        "valu", ("multiply_add", vec_val, vec_val, mul_base, c1_base)
+                    )
+                else:
+                    self.add_vliw(
+                        [
+                            ("valu", (op1, vec_tmp1, vec_val, c1_base)),
+                            ("valu", (op3, vec_tmp2, vec_val, c3_base)),
+                        ]
+                    )
+                    self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
 
             # Compute new idx
             self.add_vliw(

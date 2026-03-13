@@ -4,38 +4,86 @@
 
 This is Anthropic's Performance Engineering Take-Home Challenge. The goal is to optimize a simulated VLIW SIMD machine's kernel to minimize clock cycles.
 
-### Final Status (PRIMARY TARGET ACHIEVED!)
-- **Cycles**: 11,947 (consistent)
-- **Speedup**: 12.4x over baseline (147,734 → 11,947)
+### Latest Status (MULTIPLY-ADD BREAKTHROUGH!)
+- **Cycles**: 10,408 (consistent)
+- **Speedup**: 14.2x over baseline (147,734 → 10,408)
 - **Primary Target**: < 18,532 cycles ✅ PASSED
+- **Improvement**: 1,531 cycles (12.8%) saved vs previous best!
 - **Test parameters**: forest_height=10, rounds=16, batch_size=256
 
 ---
 
-## Final Achievement Summary
-
-### What We Achieved
+## Latest Achievement Summary
 
 | Metric | Value |
 |--------|-------|
 | Baseline Cycles | 147,734 |
-| Optimized Cycles | 11,947 |
-| Speedup | **12.4x** |
+| Optimized Cycles | 10,408 |
+| Speedup | **14.2x** |
 | Primary Target | < 18,532 ✅ PASS |
-| Theoretical Minimum | ~11,328 |
-| Gap to Theoretical | 5.5% |
+| Improvement from Multiply-Add | 1,531 cycles (12.8%) |
 
 ### Why Harder Targets Remain Unmet
 
-The harder targets (1,363-2,164 cycles) require going **5-8x BELOW** the theoretical minimum:
-- Current: 11,947 cycles
-- Theoretical minimum: ~11,328 cycles
-- Hardest target: 1,363 cycles (8.8x below theoretical!)
+The harder targets (1,363-2,164 cycles) require going **2-3x BELOW** the current optimized version:
+- Current: 10,408 cycles
+- Best remaining target: < 2,164 (need 2.08x more speedup)
+- Hardest target: < 1,363 (need 3.35x more speedup)
 
 These targets appear to require:
 1. A fundamentally different algorithm
 2. An undiscovered mathematical transformation
 3. Or extensive search time (as suggested by test names like "test_opus4_many_hours")
+
+---
+
+## 🚀 NEW DISCOVERY: Multiply-Add Mathematical Transformation
+
+### The Breakthrough
+
+**Key Insight**: Hash stages 0, 2, and 4 follow a mathematical pattern that can use `multiply_add`:
+
+| Stage | Original Formula | Mathematical Transform | multiply_add Form |
+|-------|------------------|----------------------|-------------------|
+| Stage 0 | `(val + 0x7ED55D16) + (val << 12)` | `val + val*4096 + c1` | `val * 4097 + c1` |
+| Stage 2 | `(val + 0x165667B1) + (val << 5)` | `val + val*32 + c1` | `val * 33 + c1` |
+| Stage 4 | `(val + 0xFD7046C5) + (val << 3)` | `val + val*8 + c1` | `val * 9 + c1` |
+
+### Why It Works
+
+The hash function pattern is:
+```python
+result = (val OP1 const1) OP2 (val OP3 const3)
+```
+
+When OP2 is `+`, this becomes:
+```python
+result = (val OP1 const1) + (val OP3 const3)
+       = val + const1 + (val << shift)        [when OP1=+, OP3=<<]
+       = val * (1 + 2^shift) + const1
+```
+
+The ISA provides `multiply_add(a, b, c) = (a * b + c) mod 2^32`, which perfectly handles this!
+
+### Implementation
+
+```python
+# Instead of 2 VALU ops:
+self.add_vliw([
+    ("valu", ("+", vec_tmp1, vec_val, c1_base)),       # val + c1
+    ("valu", ("<<", vec_tmp2, vec_val, shift_base)),  # val << shift
+])
+self.add("valu", ("+", vec_val, vec_tmp1, vec_tmp2))   # add them
+
+# Use 1 multiply_add:
+self.add("valu", ("multiply_add", vec_val, vec_val, mul_base, c1_base))
+```
+
+### Results
+
+- **Cycles saved**: ~1,500 cycles
+- **Percentage improvement**: 12.8%
+- **Explanation**: 3 stages × 16 rounds × 32 batches = 1,536 multiply_add operations saved
 
 ---
 
@@ -230,21 +278,21 @@ Each stage: `a = (op2(op1(a, val1)) ^ (op3(a, val3))) % 2^32`
 
 ---
 
-## Submission Test Results (Final)
+## Submission Test Results (Latest)
 
 | Test | Target | Status | Cycles |
 |------|--------|--------|--------|
 | test_kernel_correctness | Correct output | ✅ PASS | - |
-| test_kernel_speedup | < 147,734 | ✅ PASS | 11,947 |
-| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 11,947 |
-| test_opus4_many_hours | < 2,164 | ❌ FAIL | 11,947 |
-| test_opus45_casual | < 1,790 | ❌ FAIL | 11,947 |
-| test_opus45_2hr | < 1,579 | ❌ FAIL | 11,947 |
-| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 11,947 |
-| test_opus45_11hr | < 1,487 | ❌ FAIL | 11,947 |
-| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 11,947 |
+| test_kernel_speedup | < 147,734 | ✅ PASS | 10,408 |
+| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 10,408 |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL | 10,408 |
+| test_opus45_casual | < 1,790 | ❌ FAIL | 10,408 |
+| test_opus45_2hr | < 1,579 | ❌ FAIL | 10,408 |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 10,408 |
+| test_opus45_11hr | < 1,487 | ❌ FAIL | 10,408 |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 10,408 |
 
-**Achievement**: ✅ PRIMARY TARGET ACHIEVED with 12.4x speedup!
+**Achievement**: ✅ PRIMARY TARGET ACHIEVED with 14.2x speedup!
 
 ---
 
@@ -274,6 +322,8 @@ The key insight was that while we can't vectorize the indirect addressing patter
 4. Use vstore for consecutive output
 5. Bundle operations using add_vliw to maximize parallelism
 6. Use vbroadcast to efficiently broadcast constants
+7. **Use multiply_add** to fuse multiplication and addition in one cycle
+8. Process multiple rounds without storing intermediate results (eliminates memory traffic)
 
 ### Key Technical Insights
 
@@ -284,21 +334,47 @@ The key insight was that while we can't vectorize the indirect addressing patter
 5. **Use separate temporary addresses** for each of 8 parallel loads
 6. **Bundle memory ops** to use both LOAD/STORE slots in parallel
 7. **VBroadcast** is more efficient than multiple LOADs for constant vectors
+8. **Multiply-Add** can fuse multiplication and addition - look for mathematical patterns!
+9. **Multi-Round Processing** - process all rounds in one batch without storing
+
+### Attempted But Failed (New)
+
+| Attempt | Approach | Result | Learning |
+|---------|----------|--------|----------|
+| vselect elimination | Replace vselect with bitwise AND | ❌ Failed | Cannot use & because comparison gives 0/1, not all-ones mask |
 
 ---
 
-## Theoretical Analysis (Final)
+## New Learnings & Insights
+
+---
+
+## Theoretical Analysis (Latest)
 
 - **Baseline**: 147,734 cycles
 - **Previous Best (scalar)**: 90,646 cycles (1.63x speedup)
 - **VALU Vectorization**: 18,088 cycles (8.2x speedup)
 - **VALU Bundling**: 14,504 cycles (10.2x speedup)
 - **Multi-Round Processing**: 11,947 cycles (12.4x speedup)
+- **Multiply-Add Optimization**: 10,408 cycles (14.2x speedup)
 - **Primary Target**: < 18,532 ✅ ACHIEVED!
-- **Theoretical Minimum**: ~11,328 cycles
-- **Gap to Theoretical**: 5.5%
+- **Theoretical Minimum**: ~9,500 cycles (estimated with new optimization)
+- **Gap to Theoretical**: ~9.5%
 
-**Conclusion**: We've achieved the primary target and are only 5.5% above the theoretical minimum. The harder targets (1,363-2,164) are mathematically impossible with the current sequential algorithm.
+### Per-Round Cycle Breakdown (with multiply_add)
+
+| Phase | Cycles | Notes |
+|-------|--------|-------|
+| Address computation (ALU) | 1 | 8 addresses computed |
+| vload (2 items) | 1 | Load indices and values |
+| Load 8 node_vals | 4 | 2 loads/cycle |
+| XOR (valu) | 1 | Vector XOR |
+| Hash (6 stages) | 9 | 3 multiply_add + 3 stages with 2 ops |
+| idx computation | 5 | vselect for wrap-around |
+| vstore | 1 | Store indices and values |
+| **Total** | **~22** | Per batch of 8 items |
+
+**Conclusion**: We've achieved the primary target with 14.2x speedup. The harder targets (1,363-2,164) appear to require fundamental algorithmic changes or extensive search time.
 
 ---
 
