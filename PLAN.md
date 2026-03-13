@@ -5,14 +5,14 @@
 This is Anthropic's Performance Engineering Take-Home Challenge. The goal is to optimize a simulated VLIW SIMD machine's kernel to minimize clock cycles.
 
 ### Current Status (BREAKTHROUGH ACHIEVED!)
-- **Cycles**: 14,504 (VALU vectorization approach - Attempt 50)
-- **Speedup**: 10.2x over baseline
+- **Cycles**: 13,387 (Attempt 52 - VBroadcast + Memory Bundling)
+- **Speedup**: 11x over baseline
 - **Target**: < 1,363 cycles (hardest target)
 - **Test parameters**: forest_height=10, rounds=16, batch_size=256
 
 ---
 
-## Key Breakthrough: VALU Vectorization
+## Key Breakthrough: VALU Vectorization + Memory Bundling
 
 The breakthrough was using the VALU (vector) engine to process 8 items in parallel:
 
@@ -24,48 +24,95 @@ The breakthrough was using the VALU (vector) engine to process 8 items in parall
 4. **Batched loads**: Bundle load operations to use both load slots efficiently
 5. **Pre-allocated vector constants**: Broadcast constants to all 8 lanes once at startup
 6. **Bundle VALU ops**: Use add_vliw to pack multiple VALU ops in same cycle (key optimization!)
+7. **VBroadcast**: Use vbroadcast to broadcast scalar constants to all 8 lanes (replaces multiple LOADs)
+8. **Bundle memory ops**: Bundle vloads and vstores together to use both LOAD/STORE slots
 
 ### Cycle Breakdown per Batch (8 items)
 
 | Phase | Cycles | Notes |
 |-------|--------|-------|
-| vload indices | 1 | Load 8 consecutive indices |
-| vload values | 1 | Load 8 consecutive values |
+| vload indices+values | 1 | Bundled using 2 LOAD slots |
 | Compute 8 addresses | 1 | Bundled in one add_vliw (uses 12 ALU slots) |
 | Load 8 node_vals | 4 | 2 loads/cycle, 4 cycles |
 | XOR (valu) | 1 | Vector XOR |
-| Hash (valu) | 12 | 6 stages × 2 cycles each |
+| Hash (valu) | 12 | 6 stages × 2 cycles each (bundled op1+op3) |
 | idx computation | 5 | Vector bitwise + arithmetic |
-| vstore indices | 1 | Store 8 results |
-| vstore values | 1 | Store 8 results |
-| **Total** | **~27** | Per batch of 8 items |
+| vstore indices+values | 1 | Bundled using 2 STORE slots |
+| **Total** | **~26** | Per batch of 8 items |
 
 ---
 
-## Latest Discoveries (Attempt 50)
+## Latest Discoveries (Attempt 52)
 
-### VALU Bundling Discovery
-- **Discovery**: Using add_vliw() to bundle multiple VALU ops in same cycle
-- **Key insight**: The add() method creates separate instructions, add_vliw() bundles them
-- **Implementation**: Bundle op1 + op3 for each hash stage, and idx << + idx & operations
-- **Savings**: 3,584 cycles (20% improvement!)
+### VBroadcast Discovery
+- **Discovery**: Use vbroadcast to broadcast scalar constants to all 8 vector lanes
+- **Implementation**: Instead of 8 individual LOADs, use 1 vbroadcast
+- **Savings**: ~100 cycles total
 
-### Pause Instruction Analysis
-- **Discovery**: Test harness sets `machine.enable_pause = False`
-- **Finding**: Pauses don't pause execution but still count as cycles
-- **Action**: Removed unnecessary pause instructions
-- **Savings**: 2 cycles (minimal compared to VALU bundling)
+### Memory Bundle Discovery  
+- **Discovery**: Bundle vloads and vstores together using both LOAD/STORE slots
+- **Key insight**: LOAD engine has 2 slots, STORE engine has 2 slots
+- **vloads**: 2 separate vloads → 1 bundled vload = 512 cycles saved
+- **vstores**: 2 separate vstores → 1 bundled vstore = 512 cycles saved
 
-### Instruction Breakdown Analysis
-- Total instructions: 18,088 (equals cycle count)
-- load: 3239, alu: 1025, valu: 12288, flow: 512, store: 1024
-- 512 flow = vselect operations (1 per batch)
-- No pause instructions in current kernel (removed)
+### Attempted But Failed
 
-### Hash Optimization Analysis
-- 6 stages × 2 cycles = 12 cycles per batch minimum
-- Cannot reduce further due to dependencies: each stage uses result of previous
-- multiply_add doesn't help for this algorithm
+1. **Bitwise OR for idx computation**: Tried using OR instead of ADD for idx calculation
+   - Reasoning: (idx << 1) | 1 | (val & 1) should equal idx*2 + 1 + val%2
+   - **Result**: FAILED - produces incorrect results due to carry behavior
+   - **Learning**: Cannot optimize addition with bitwise operations when carries matter
+
+2. **Software Pipelining**: Tried computing next batch addresses during current batch
+   - **Result**: Made it WORSE (14,907 cycles vs 14,411)
+   - **Learning**: The overhead of extra ALU ops doesn't pay off; current approach is already well-optimized
+
+---
+
+## Key Learnings & Insights
+
+### 1. Understanding add() vs add_vliw()
+
+The most critical discovery was understanding how the instruction bundling works:
+
+| Method | Behavior | Use Case |
+|--------|----------|----------|
+| `add(engine, slot)` | Creates SEPARATE instruction (1 cycle) | When you need ordering |
+| `add_vliw(slots)` | Bundles MULTIPLE ops in SAME cycle | When ops are independent |
+
+**Key insight**: `add_vliw` is essential for utilizing all 6 VALU slots in parallel.
+
+### 2. Engine Slot Utilization
+
+Understanding slot limits is crucial for optimization:
+
+| Engine | Slots | Optimization Strategy |
+|--------|-------|---------------------|
+| alu | 12 | Compute all 8 addresses in parallel |
+| valu | 6 | Bundle op1+op3 per hash stage |
+| load | 2 | Bundle vloads together |
+| store | 2 | Bundle vstores together |
+| flow | 1 | vselect for wrap-around |
+
+### 3. VBroadcast vs Multiple Loads
+
+When you need the same constant in all 8 vector lanes:
+
+| Approach | Cycles | Notes |
+|----------|--------|-------|
+| 8 individual LOADs | 4 | 2 loads/cycle |
+| 1 vbroadcast | 1 | Single VALU cycle |
+| **Savings** | **3 cycles** | Per constant vector |
+
+### 4. Theoretical Limits
+
+- **Current**: 13,387 cycles
+- **Theoretical minimum**: ~11,264 cycles
+- **Hardest target**: 1,363 cycles (requires ~8x below theoretical!)
+
+The hardest targets appear mathematically impossible with current algorithm - they likely require:
+- A fundamentally different algorithm
+- Some undiscovered ISA feature
+- Multiple rounds of computation in parallel
 
 ---
 
@@ -105,6 +152,7 @@ The breakthrough was using the VALU (vector) engine to process 8 items in parall
 | vbroadcast | valu | Broadcast scalar to all VLEN lanes |
 | vselect | flow | Vector conditional select |
 | valu ops | valu | Element-wise vector operations |
+| multiply_add | valu | Fused multiply-add (a*b + c) |
 
 ---
 
@@ -145,16 +193,16 @@ Each stage: `a = (op2(op1(a, val1)) ^ (op3(a, val3))) % 2^32`
 | Test | Target | Status | Cycles |
 |------|--------|--------|--------|
 | test_kernel_correctness | Correct output | ✅ PASS | - |
-| test_kernel_speedup | < 147,734 | ✅ PASS | 14,504 |
-| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 14,504 |
-| test_opus4_many_hours | < 2,164 | ❌ FAIL | 14,504 |
-| test_opus45_casual | < 1,790 | ❌ FAIL | 14,504 |
-| test_opus45_2hr | < 1,579 | ❌ FAIL | 14,504 |
-| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 14,504 |
-| test_opus45_11hr | < 1,487 | ❌ FAIL | 14,504 |
-| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 14,504 |
+| test_kernel_speedup | < 147,734 | ✅ PASS | 13,387 |
+| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 13,387 |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL | 13,387 |
+| test_opus45_casual | < 1,790 | ❌ FAIL | 13,387 |
+| test_opus45_2hr | < 1,579 | ❌ FAIL | 13,387 |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 13,387 |
+| test_opus45_11hr | < 1,487 | ❌ FAIL | 13,387 |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 13,387 |
 
-**Achievement**: We've passed test_kernel_updated_starting_point with 10.2x speedup! This was the main milestone.
+**Achievement**: We've passed test_kernel_updated_starting_point with 11x speedup! This was the main milestone.
 
 ---
 
@@ -171,15 +219,19 @@ Each stage: `a = (op2(op1(a, val1)) ^ (op3(a, val3))) % 2^32`
 | 2-way Loop Unrolling | Process 2 items/iter | ⚠️ No change | Dependencies prevent parallelism |
 | Software Pipelining | Overlap iterations | ❌ Failed | Correctness bugs |
 | Bit Operations | Replace `%2` with `&1` | ❌ No change | Hash is bottleneck |
-| vload for Round 0 | Vectorize first 8 items | ❌ Failed | Mixing vector/scalar issues |
+| vload for Round 0 | Vectorize first 8 items | ❌ Failed | mixing vector/scalar issues |
+| Bitwise OR idx | Use OR instead of ADD | ❌ Failed | Carry behavior breaks correctness |
+| Next Batch Pipelining | Compute next batch during current | ❌ Worse | Overhead > savings |
 
-### What Finally Worked (Attempt 41)
+### What Finally Worked
 
 The key insight was that while we can't vectorize the indirect addressing pattern directly, we CAN:
 1. Batch the address computation using all 12 ALU slots
 2. Use vload for the consecutive input arrays
 3. Use VALU for hash computation (since all 8 items compute hash simultaneously)
 4. Use vstore for consecutive output
+5. Bundle operations using add_vliw to maximize parallelism
+6. Use vbroadcast to efficiently broadcast constants
 
 ### Key Technical Insights
 
@@ -188,6 +240,8 @@ The key insight was that while we can't vectorize the indirect addressing patter
 3. **Broadcast constants** by loading them into all VLEN lanes at startup
 4. **Bundle operations** using add_vliw to maximize parallelism
 5. **Use separate temporary addresses** for each of 8 parallel loads
+6. **Bundle memory ops** to use both LOAD/STORE slots in parallel
+7. **VBroadcast** is more efficient than multiple LOADs for constant vectors
 
 ---
 
@@ -196,13 +250,12 @@ The key insight was that while we can't vectorize the indirect addressing patter
 - **Baseline**: 147,734 cycles
 - **Previous Best (scalar)**: 90,646 cycles (1.63x speedup)
 - **VALU Vectorization**: 18,088 cycles (8.2x speedup)
-- **Current (Bundled VALU)**: 14,504 cycles (10.2x speedup)
+- **VALU Bundling**: 14,504 cycles (10.2x speedup)
+- **VBroadcast + Memory Bundling**: 13,387 cycles (11x speedup)
 - **Target (hardest)**: < 1,363 cycles (need ~10x more)
 - **Theoretical Minimum**: ~11,264 cycles (hash + memory + overhead with perfect bundling)
 
 **Key Finding**: The hardest target (1,363) is still below our theoretical minimum (~11,264), suggesting it requires a fundamentally different algorithm or additional optimizations not yet discovered.
-
-**Note**: Attempt 50's VALU bundling was a major breakthrough, reducing cycles by 20% (3,584 cycles saved).
 
 ---
 

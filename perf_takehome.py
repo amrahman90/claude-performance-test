@@ -89,13 +89,25 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Attempt 49: Remove pauses (enable_pause=False in test harness)
+        Attempt 52: VBroadcast + Memory Bundle Optimizations
 
-        Key insight: Test harness sets enable_pause=False, so pauses don't pause
-        the core but still count as cycles. Removing them saves 514 cycles!
+        Key optimizations:
+        1. VBroadcast: Use vbroadcast to broadcast constants to vector registers
+           - Instead of 8 LOADs, use 1 vbroadcast
+           - Saves: ~100 cycles
 
-        Previous: 18,090 cycles
-        Expected: ~17,576 cycles (18,090 - 514)
+        2. Bundle vloads: Use both LOAD slots in same cycle
+           - Before: 2 cycles (separate vload for indices and values)
+           - After: 1 cycle (bundled)
+           - Savings: 512 cycles
+
+        3. Bundle vstores: Use both STORE slots in same cycle
+           - Before: 2 cycles
+           - After: 1 cycle
+           - Savings: 512 cycles
+
+        Previous: 14,504 cycles
+        Current: 13,387 cycles (7.7% improvement!)
         """
         # === Allocate scratch ===
         # Vector registers (VLEN=8 consecutive locations each)
@@ -138,41 +150,39 @@ class KernelBuilder:
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
 
-        # Pre-compute hash constants as vector registers (broadcast to all 8 lanes)
+        # Pre-compute hash constants using VBROADCAST
         hash_consts_valu = []
         for stage_idx, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
-            # Broadcast const1 to all 8 lanes
+            const1_scalar = self.scratch_const(val1)
+            const3_scalar = self.scratch_const(val3)
             const1_base = self.alloc_scratch(f"hc1_{stage_idx}", VLEN)
-            for i in range(VLEN):
-                self.add("load", ("const", const1_base + i, val1))
-            # Broadcast const3 to all 8 lanes
             const3_base = self.alloc_scratch(f"hc3_{stage_idx}", VLEN)
-            for i in range(VLEN):
-                self.add("load", ("const", const3_base + i, val3))
+            self.add("valu", ("vbroadcast", const1_base, const1_scalar))
+            self.add("valu", ("vbroadcast", const3_base, const3_scalar))
             hash_consts_valu.append((const1_base, const3_base))
 
-        # Pre-allocate shift constant vector (value = 1)
+        # Pre-allocate shift constant vector using vbroadcast
         shift_const_base = self.alloc_scratch("shift_const", VLEN)
-        for i in range(VLEN):
-            self.add("load", ("const", shift_const_base + i, 1))
+        shift_scalar = self.scratch_const(1)
+        self.add("valu", ("vbroadcast", shift_const_base, shift_scalar))
 
-        # Pre-allocate zero vector
+        # Pre-allocate zero vector using vbroadcast
         zero_vec_base = self.alloc_scratch("zero_vec", VLEN)
-        for i in range(VLEN):
-            self.add("load", ("const", zero_vec_base + i, 0))
+        zero_scalar = self.scratch_const(0)
+        self.add("valu", ("vbroadcast", zero_vec_base, zero_scalar))
 
-        # Pre-allocate n_nodes vector (fixed constant, not loaded from memory)
+        # Pre-allocate n_nodes vector using vbroadcast
         n_nodes_base = self.alloc_scratch("n_nodes_vec", VLEN)
-        for i in range(VLEN):
-            self.add("load", ("const", n_nodes_base + i, n_nodes))
+        n_nodes_scalar = self.scratch_const(n_nodes)
+        self.add("valu", ("vbroadcast", n_nodes_base, n_nodes_scalar))
 
-        # Pre-compute ALL batch offsets once at startup (KEY OPTIMIZATION)
+        # Pre-compute ALL batch offsets once at startup
         n_batches = batch_size // VLEN
         batch_offsets = []
         for batch_start in range(0, batch_size, VLEN):
             batch_offsets.append(self.scratch_const(batch_start))
 
-        # Pre-compute addresses for batch 0
+        # Pre-compute addresses for first batch
         self.add_vliw(
             [
                 (
@@ -183,15 +193,11 @@ class KernelBuilder:
             ]
         )
 
-        # REMOVED: pause instruction (saves 1 cycle)
-        # self.add("flow", ("pause",))
-
         # Process all rounds - fully unrolled
-        # This eliminates loop overhead and allows better instruction scheduling
         for _ in range(rounds):
             # Process items in batches of VLEN=8
             for batch_offset in batch_offsets:
-                # Compute base addresses for this batch (use pre-computed offset)
+                # Compute base addresses for THIS batch
                 self.add_vliw(
                     [
                         (
@@ -205,14 +211,15 @@ class KernelBuilder:
                     ]
                 )
 
-                # vload 8 consecutive indices
-                self.add("load", ("vload", vec_idx, tmp1))
-
-                # vload 8 consecutive values
-                self.add("load", ("vload", vec_val, tmp2))
+                # vload 8 consecutive indices AND values in parallel (2 LOAD slots)
+                self.add_vliw(
+                    [
+                        ("load", ("vload", vec_idx, tmp1)),
+                        ("load", ("vload", vec_val, tmp2)),
+                    ]
+                )
 
                 # Phase 1: Compute all 8 node addresses in PARALLEL
-                # With 12 ALU slots, we can do all 8 address computations in one cycle!
                 addr_compute_ops = []
                 for i in range(VLEN):
                     addr_compute_ops.append(
@@ -240,7 +247,6 @@ class KernelBuilder:
                 self.add("valu", ("^", vec_val, vec_val, vec_node_val))
 
                 # Hash computation using VALU (parallel for all 8 items)
-                # Use add_vliw to bundle independent ops in same cycle
                 for stage_idx, (c1_base, c3_base) in enumerate(hash_consts_valu):
                     op1, _, op2, op3, _ = HASH_STAGES[stage_idx]
 
@@ -266,7 +272,7 @@ class KernelBuilder:
                     ]
                 )
 
-                # Cycle 2: 1 + (val & 1) and idx << 1 ready for next
+                # Cycle 2: 1 + (val & 1)
                 self.add_vliw(
                     [
                         ("valu", ("+", vec_tmp3, vec_tmp2, shift_const_base)),
@@ -282,15 +288,13 @@ class KernelBuilder:
                 # Cycle 5: vselect wrap
                 self.add("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, zero_vec_base))
 
-                # vstore 8 consecutive indices
-                self.add("store", ("vstore", tmp1, vec_idx))
-
-                # vstore 8 consecutive values
-                self.add("store", ("vstore", tmp2, vec_val))
-
-        # REMOVED: final pause (saves 1 cycle)
-        # Also removed per-batch pauses (saves 512 cycles)
-        # Total savings: 514 cycles!
+                # vstore 8 consecutive indices AND values in parallel (2 STORE slots)
+                self.add_vliw(
+                    [
+                        ("store", ("vstore", tmp1, vec_idx)),
+                        ("store", ("vstore", tmp2, vec_val)),
+                    ]
+                )
 
 
 BASELINE = 147734

@@ -2,11 +2,53 @@
 
 ## 🎉 MAJOR ACHIEVEMENT - BREAKTHROUGH!
 
-### Current Status (Attempt 50)
-- **Cycles**: 14,504 ✅
-- **Speedup**: **10.2x** over baseline (147,734 → 14,504)
+### Current Status (Attempt 52)
+- **Cycles**: 13,387 ✅
+- **Speedup**: **11x** over baseline (147,734 → 13,387)
 - **Target Met**: test_kernel_updated_starting_point (< 18,532) ✅ PASS!
-- **Change**: Bundle VALU ops using add_vliw (saved 3,584 cycles!)
+- **Changes**: 
+  1. VBroadcast for constants (saved ~100 cycles)
+  2. Bundled vloads (saved 512 cycles)
+  3. Bundled vstores (saved 512 cycles)
+
+---
+
+## Attempt 52: VBroadcast + Memory Bundling
+
+**Date**: 2026-03-13
+**Cycles**: 13,387
+**Status**: ✅ Further improvement (7.7% reduction!)
+
+### What Was Tried:
+
+1. **VBroadcast for constants**: Replace 8 individual LOADs with single vbroadcast
+   - Before: 8 LOAD cycles per constant vector
+   - After: 1 VALU cycle (vbroadcast)
+   - Savings: ~100 cycles total
+
+2. **Bundle vloads**: Use both LOAD slots for simultaneous vload
+   - Before: 2 separate vload cycles
+   - After: 1 bundled vload cycle
+   - Savings: 1 cycle per batch × 512 batches = 512 cycles
+
+3. **Bundle vstores**: Use both STORE slots for simultaneous vstore
+   - Before: 2 separate vstore cycles
+   - After: 1 bundled vstore cycle
+   - Savings: 1 cycle per batch × 512 batches = 512 cycles
+
+### Test Results
+
+| Test | Target | Status |
+|------|--------|--------|
+| test_kernel_correctness | Correct output | ✅ PASS |
+| test_kernel_speedup | < 147,734 | ✅ PASS |
+| **test_kernel_updated_starting_point** | **< 18,532** | ✅ **PASS** |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL |
+| test_opus45_casual | < 1,790 | ❌ FAIL |
+| test_opus45_2hr | < 1,579 | ❌ FAIL |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL |
+| test_opus45_11hr | < 1,487 | ❌ FAIL |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL |
 
 ---
 
