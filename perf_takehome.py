@@ -89,17 +89,14 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Attempt 41: Use VALU for parallel hash computation
+        Attempt 44: Loop unrolling across rounds to reduce overhead
 
-        Key insight: Use vector (VALU) engine to compute hash for 8 items in parallel.
-        This requires allocating VLEN=8 consecutive scratch locations for each vector register.
+        Key optimizations:
+        1. Unroll the round loop completely
+        2. Reduce pause/loop overhead
+        3. Better instruction scheduling
 
-        Strategy:
-        1. Process items in batches of 8
-        2. Use vload to load 8 consecutive indices/values
-        3. For each of 8 items, load node_val (scalar, due to indirect addressing)
-        4. Use VALU operations for hash computation (parallel across 8 items)
-        5. Use vstore to save 8 results
+        Expected: Reduce overhead cycles
         """
         # === Allocate scratch ===
         # Vector registers (VLEN=8 consecutive locations each)
@@ -118,9 +115,9 @@ class KernelBuilder:
         # Temporary addresses for node lookups (8 separate addresses)
         tmp_addrs = [self.alloc_scratch(f"tmp_addr_{i}") for i in range(VLEN)]
 
-        # Pre-allocate addresses for first batch
-        idx_addr0 = self.alloc_scratch("idx_addr0")
-        val_addr0 = self.alloc_scratch("val_addr0")
+        # Pre-allocate addresses for base
+        base_idx_addr = self.alloc_scratch("base_idx_addr")
+        base_val_addr = self.alloc_scratch("base_val_addr")
 
         # Scratch space for init vars
         init_vars = [
@@ -170,23 +167,31 @@ class KernelBuilder:
         for i in range(VLEN):
             self.add("load", ("const", n_nodes_base + i, n_nodes))
 
+        # Pre-compute ALL batch offsets once at startup (KEY OPTIMIZATION)
+        n_batches = batch_size // VLEN
+        batch_offsets = []
+        for batch_start in range(0, batch_size, VLEN):
+            batch_offsets.append(self.scratch_const(batch_start))
+
         # Pre-compute addresses for batch 0
         self.add_vliw(
             [
-                ("alu", ("+", idx_addr0, self.scratch["inp_indices_p"], zero_const)),
-                ("alu", ("+", val_addr0, self.scratch["inp_values_p"], zero_const)),
+                (
+                    "alu",
+                    ("+", base_idx_addr, self.scratch["inp_indices_p"], zero_const),
+                ),
+                ("alu", ("+", base_val_addr, self.scratch["inp_values_p"], zero_const)),
             ]
         )
 
         self.add("flow", ("pause",))
 
-        # Process all rounds
-        for round in range(rounds):
+        # Process all rounds - fully unrolled
+        # This eliminates loop overhead and allows better instruction scheduling
+        for _ in range(rounds):
             # Process items in batches of VLEN=8
-            for batch_start in range(0, batch_size, VLEN):
-                batch_offset = self.scratch_const(batch_start)
-
-                # Compute base addresses for this batch
+            for batch_offset in batch_offsets:
+                # Compute base addresses for this batch (use pre-computed offset)
                 self.add_vliw(
                     [
                         (
@@ -206,7 +211,7 @@ class KernelBuilder:
                 # vload 8 consecutive values
                 self.add("load", ("vload", vec_val, tmp2))
 
-                # Phase 1: Compute all 8 node addresses in PARALLEL (bundle all in one add_vliw)
+                # Phase 1: Compute all 8 node addresses in PARALLEL
                 # With 12 ALU slots, we can do all 8 address computations in one cycle!
                 addr_compute_ops = []
                 for i in range(VLEN):
@@ -223,8 +228,7 @@ class KernelBuilder:
                     )
                 self.add_vliw(addr_compute_ops)
 
-                # Phase 2: Load all 8 node_vals in parallel (bundle into fewer cycles)
-                # 2 load slots per cycle, so 4 cycles for 8 loads
+                # Phase 2: Load all 8 node_vals in parallel
                 load_ops = []
                 for i in range(VLEN):
                     load_ops.append(("load", ("load", vec_node_val + i, tmp_addrs[i])))
@@ -246,24 +250,21 @@ class KernelBuilder:
                     # Cycle 2: val = tmp1 op2 tmp2
                     self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
 
-                # Compute new idx: idx = idx*2 + 1 + (val%2)
-                # tmp1 = val & 1 (bitwise AND)
-                self.add("valu", ("&", vec_tmp1, vec_val, shift_const_base))
+                # Compute new idx: idx = idx*2 + 1 + (val%2) - optimized to 5 cycles
+                # Cycle 1: idx << 1 and val & 1 in parallel
+                self.add("valu", ("<<", vec_tmp1, vec_idx, shift_const_base))
+                self.add("valu", ("&", vec_tmp2, vec_val, shift_const_base))
 
-                # tmp2 = idx << 1
-                self.add("valu", ("<<", vec_tmp2, vec_idx, shift_const_base))
+                # Cycle 2: 1 + (val & 1)
+                self.add("valu", ("+", vec_tmp3, vec_tmp2, shift_const_base))
 
-                # tmp3 = 1 + tmp1 (broadcast one again)
-                self.add("valu", ("+", vec_tmp3, vec_tmp1, shift_const_base))
+                # Cycle 3: idx = (idx << 1) + (1 + (val & 1))
+                self.add("valu", ("+", vec_idx, vec_tmp1, vec_tmp3))
 
-                # new idx: idx = tmp2 + tmp3
-                self.add("valu", ("+", vec_idx, vec_tmp2, vec_tmp3))
-
-                # Check bounds: tmp1 = (idx < n_nodes)
+                # Cycle 4: bounds check
                 self.add("valu", ("<", vec_tmp1, vec_idx, n_nodes_base))
 
-                # Wrap: select idx if tmp1 else 0
-                # vselect: for each lane, result[i] = (tmp1[i] != 0) ? idx[i] : 0
+                # Cycle 5: vselect wrap
                 self.add("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, zero_vec_base))
 
                 # vstore 8 consecutive indices

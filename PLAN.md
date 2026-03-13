@@ -171,7 +171,9 @@ The key insight was that while we can't vectorize the indirect addressing patter
 - **Target (hardest)**: < 1,363 cycles (need ~13x more)
 - **Theoretical Minimum**: ~1,536 cycles (with perfect 8-way vectorization)
 
-**Gap Analysis**: The hardest target (1,363) is below our theoretical minimum (~1,536), suggesting it may require a fundamentally different algorithm or additional optimizations not yet discovered.
+**Key Finding**: The hardest target (1,363) is BELOW our theoretical minimum (~1,536), suggesting it may require a fundamentally different algorithm or additional optimizations not yet discovered.
+
+**Note**: Attempts 42-43 to further optimize (parallel idx computation, pre-computed batch offsets) did not improve the cycle count. The bottleneck is primarily the hash computation (12 cycles per batch minimum).
 
 ---
 
