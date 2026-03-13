@@ -89,27 +89,38 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Attempt 34: Optimized idx computation (CURRENT BEST)
+        Attempt 41: Use VALU for parallel hash computation
 
-        Simplified idx computation:
-        Instead of: select(1 or 2) then add
-        Use: idx*2 + 1 + (val%2)
+        Key insight: Use vector (VALU) engine to compute hash for 8 items in parallel.
+        This requires allocating VLEN=8 consecutive scratch locations for each vector register.
 
-        This reduces from 7 cycles to 4 cycles for idx computation.
-        Saved ~4k cycles vs baseline.
+        Strategy:
+        1. Process items in batches of 8
+        2. Use vload to load 8 consecutive indices/values
+        3. For each of 8 items, load node_val (scalar, due to indirect addressing)
+        4. Use VALU operations for hash computation (parallel across 8 items)
+        5. Use vstore to save 8 results
         """
         # === Allocate scratch ===
+        # Vector registers (VLEN=8 consecutive locations each)
+        vec_idx = self.alloc_scratch("vec_idx", VLEN)  # 8 idx values
+        vec_val = self.alloc_scratch("vec_val", VLEN)  # 8 val values
+        vec_node_val = self.alloc_scratch("vec_node_val", VLEN)  # 8 node_val values
+        vec_tmp1 = self.alloc_scratch("vec_tmp1", VLEN)
+        vec_tmp2 = self.alloc_scratch("vec_tmp2", VLEN)
+        vec_tmp3 = self.alloc_scratch("vec_tmp3", VLEN)
+
+        # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
 
-        # Pre-allocate addresses for all batch items
-        idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(batch_size)]
-        val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(batch_size)]
+        # Temporary addresses for node lookups (8 separate addresses)
+        tmp_addrs = [self.alloc_scratch(f"tmp_addr_{i}") for i in range(VLEN)]
+
+        # Pre-allocate addresses for first batch
+        idx_addr0 = self.alloc_scratch("idx_addr0")
+        val_addr0 = self.alloc_scratch("val_addr0")
 
         # Scratch space for init vars
         init_vars = [
@@ -130,135 +141,136 @@ class KernelBuilder:
         # Pre-load constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
 
-        # Pre-compute hash constants
-        hash_consts = []
-        for _, val1, _, _, val3 in HASH_STAGES:
-            hash_consts.append((self.scratch_const(val1), self.scratch_const(val3)))
+        # Pre-compute hash constants as vector registers (broadcast to all 8 lanes)
+        hash_consts_valu = []
+        for stage_idx, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
+            # Broadcast const1 to all 8 lanes
+            const1_base = self.alloc_scratch(f"hc1_{stage_idx}", VLEN)
+            for i in range(VLEN):
+                self.add("load", ("const", const1_base + i, val1))
+            # Broadcast const3 to all 8 lanes
+            const3_base = self.alloc_scratch(f"hc3_{stage_idx}", VLEN)
+            for i in range(VLEN):
+                self.add("load", ("const", const3_base + i, val3))
+            hash_consts_valu.append((const1_base, const3_base))
 
-        # Pre-compute all addresses for the batch
-        for i in range(batch_size):
-            i_const = self.scratch_const(i)
-            self.add_vliw(
-                [
-                    (
-                        "alu",
-                        ("+", idx_addrs[i], self.scratch["inp_indices_p"], i_const),
-                    ),
-                    ("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], i_const)),
-                ]
-            )
+        # Pre-allocate shift constant vector
+        shift_const_base = self.alloc_scratch("shift_const", VLEN)
+        for i in range(VLEN):
+            self.add("load", ("const", shift_const_base + i, 1))
+
+        # Pre-allocate zero vector
+        zero_vec_base = self.alloc_scratch("zero_vec", VLEN)
+        for i in range(VLEN):
+            self.add("load", ("const", zero_vec_base + i, 0))
+
+        # Pre-allocate n_nodes vector
+        n_nodes_base = self.alloc_scratch("n_nodes_vec", VLEN)
+        for i in range(VLEN):
+            self.add("load", ("const", n_nodes_base + i, n_nodes))
+
+        # Pre-compute addresses for batch 0
+        self.add_vliw(
+            [
+                ("alu", ("+", idx_addr0, self.scratch["inp_indices_p"], zero_const)),
+                ("alu", ("+", val_addr0, self.scratch["inp_values_p"], zero_const)),
+            ]
+        )
 
         self.add("flow", ("pause",))
 
-        # Process all items for all rounds
+        # Process all rounds
         for round in range(rounds):
-            for i in range(batch_size):
-                idx_addr = idx_addrs[i]
-                val_addr = val_addrs[i]
+            # Process items in batches of VLEN=8
+            for batch_start in range(0, batch_size, VLEN):
+                batch_offset = self.scratch_const(batch_start)
 
-                # Load idx and val in parallel (2 load slots)
-                self.add_vliw(
-                    [
-                        ("load", ("load", tmp_idx, idx_addr)),
-                        ("load", ("load", tmp_val, val_addr)),
-                    ]
-                )
-
-                # Compute node address (1 ALU)
+                # Compute base addresses for this batch
                 self.add_vliw(
                     [
                         (
                             "alu",
-                            ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx),
+                            ("+", tmp1, self.scratch["inp_indices_p"], batch_offset),
+                        ),
+                        (
+                            "alu",
+                            ("+", tmp2, self.scratch["inp_values_p"], batch_offset),
                         ),
                     ]
                 )
 
-                # Load node_val (1 load)
-                self.add_vliw(
-                    [
-                        ("load", ("load", tmp_node_val, tmp_addr)),
-                    ]
-                )
+                # vload 8 consecutive indices
+                self.add("load", ("vload", vec_idx, tmp1))
 
-                # XOR val with node_val (1 ALU)
-                self.add_vliw(
-                    [
-                        ("alu", ("^", tmp_val, tmp_val, tmp_node_val)),
-                    ]
-                )
+                # vload 8 consecutive values
+                self.add("load", ("vload", vec_val, tmp2))
 
-                # Hash stages - pack 2 ALU ops in each cycle where possible
-                for hi, (c1, c3) in enumerate(hash_consts):
-                    op1, _, op2, op3, _ = HASH_STAGES[hi]
-                    # Two independent ALU ops in parallel
-                    self.add_vliw(
-                        [
-                            ("alu", (op1, tmp1, tmp_val, c1)),
-                            ("alu", (op3, tmp2, tmp_val, c3)),
-                        ]
+                # Phase 1: Compute all 8 node addresses in PARALLEL (bundle all in one add_vliw)
+                # With 12 ALU slots, we can do all 8 address computations in one cycle!
+                addr_compute_ops = []
+                for i in range(VLEN):
+                    addr_compute_ops.append(
+                        (
+                            "alu",
+                            (
+                                "+",
+                                tmp_addrs[i],
+                                self.scratch["forest_values_p"],
+                                vec_idx + i,
+                            ),
+                        )
                     )
-                    # Third ALU op depends on previous two
-                    self.add_vliw(
-                        [
-                            ("alu", (op2, tmp_val, tmp1, tmp2)),
-                        ]
-                    )
+                self.add_vliw(addr_compute_ops)
 
-                # Optimized idx computation: idx = idx*2 + 1 + (val%2)
-                # This is equivalent to: idx*2 + (1 or 2) based on val%2
-                #
-                # Step 1: tmp1 = val % 2 (0 if even, 1 if odd)
-                # Step 2: tmp2 = idx * 2
-                # Step 3: tmp3 = 1 + tmp1 = 1 (if even) or 2 (if odd)
-                # Step 4: tmp_idx = tmp2 + tmp3 = idx*2 + (1 or 2)
-                # Step 5: Check bounds and wrap
+                # Phase 2: Load all 8 node_vals in parallel (bundle into fewer cycles)
+                # 2 load slots per cycle, so 4 cycles for 8 loads
+                load_ops = []
+                for i in range(VLEN):
+                    load_ops.append(("load", ("load", vec_node_val + i, tmp_addrs[i])))
+                # Bundle as many loads as possible per cycle
+                for i in range(0, VLEN, 2):
+                    self.add_vliw(load_ops[i : i + 2])
 
-                # Compute: tmp1 = val % 2, tmp2 = idx * 2
-                self.add_vliw(
-                    [
-                        ("alu", ("%", tmp1, tmp_val, two_const)),
-                        ("alu", ("*", tmp2, tmp_idx, two_const)),
-                    ]
-                )
+                # XOR: val[i] = val[i] ^ node_val[i] for all 8 items
+                self.add("valu", ("^", vec_val, vec_val, vec_node_val))
 
-                # Compute: tmp3 = 1 + tmp1 (tmp1 is 0 or 1)
-                self.add_vliw(
-                    [
-                        ("alu", ("+", tmp3, tmp1, one_const)),
-                    ]
-                )
+                # Hash computation using VALU (parallel for all 8 items)
+                for stage_idx, (c1_base, c3_base) in enumerate(hash_consts_valu):
+                    op1, _, op2, op3, _ = HASH_STAGES[stage_idx]
 
-                # Compute new idx: tmp_idx = tmp2 + tmp3 = idx*2 + (1 or 2)
-                self.add_vliw(
-                    [
-                        ("alu", ("+", tmp_idx, tmp2, tmp3)),
-                    ]
-                )
+                    # Cycle 1: tmp1 = val + c1, tmp2 = val ^ c3 (parallel)
+                    self.add("valu", (op1, vec_tmp1, vec_val, c1_base))
+                    self.add("valu", (op3, vec_tmp2, vec_val, c3_base))
 
-                # Check if idx >= n_nodes
-                self.add_vliw(
-                    [
-                        ("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])),
-                    ]
-                )
+                    # Cycle 2: val = tmp1 op2 tmp2
+                    self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
 
-                # Select new idx or 0
-                self.add_vliw(
-                    [
-                        ("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)),
-                    ]
-                )
+                # Compute new idx: idx = idx*2 + 1 + (val%2)
+                # tmp1 = val & 1 (bitwise AND)
+                self.add("valu", ("&", vec_tmp1, vec_val, shift_const_base))
 
-                # Store idx and val in parallel (2 store slots)
-                self.add_vliw(
-                    [
-                        ("store", ("store", idx_addr, tmp_idx)),
-                        ("store", ("store", val_addr, tmp_val)),
-                    ]
-                )
+                # tmp2 = idx << 1
+                self.add("valu", ("<<", vec_tmp2, vec_idx, shift_const_base))
+
+                # tmp3 = 1 + tmp1 (broadcast one again)
+                self.add("valu", ("+", vec_tmp3, vec_tmp1, shift_const_base))
+
+                # new idx: idx = tmp2 + tmp3
+                self.add("valu", ("+", vec_idx, vec_tmp2, vec_tmp3))
+
+                # Check bounds: tmp1 = (idx < n_nodes)
+                self.add("valu", ("<", vec_tmp1, vec_idx, n_nodes_base))
+
+                # Wrap: select idx if tmp1 else 0
+                # vselect: for each lane, result[i] = (tmp1[i] != 0) ? idx[i] : 0
+                self.add("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, zero_vec_base))
+
+                # vstore 8 consecutive indices
+                self.add("store", ("vstore", tmp1, vec_idx))
+
+                # vstore 8 consecutive values
+                self.add("store", ("vstore", tmp2, vec_val))
 
         self.instrs.append({"flow": [("pause",)]})
 

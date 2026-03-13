@@ -1,31 +1,242 @@
 # Changelog - Anthropic Performance Take-Home Optimization
 
-## Summary
+## 🎉 MAJOR ACHIEVEMENT - BREAKTHROUGH!
 
-After extensive optimization attempts, we have achieved **90,646 cycles** (1.63x speedup over baseline). However, the target of <1,363 cycles (requiring 70x+ speedup) remains unreachable with the current scalar approach.
+### Current Status
+- **Cycles**: 18,090 ✅
+- **Speedup**: **8.2x** over baseline (147,734 → 18,090)
+- **Target Met**: test_kernel_updated_starting_point (< 18,532) ✅ PASS!
 
-### Key Findings
-
-1. **Fundamental Bottleneck**: The indirect addressing pattern `mem[forest_values_p + idx]` where idx varies per item prevents full vectorization with vload/vstore.
-
-2. **Hash is Serial**: The 6-stage hash function has strict dependencies between stages, preventing parallel computation.
-
-3. **Per-item Processing Required**: Each of 4,096 items (256 × 16) requires ~22 cycles due to hash dependencies, totaling ~90k cycles.
-
-4. **Theoretical Minimum**: With perfect vectorization (8 items per vector): 512 vector iterations × ~3 cycles = ~1,536 cycles. This is very close to the target of 1,363!
-
-5. **What Would 70x Speedup Require**:
-   - Near-perfect vectorization of all operations
-   - Breaking the indirect addressing bottleneck
-   - Currently impossible due to ISA limitations
-
-### Submission Test Results
+### Test Results
 
 | Test | Target | Status |
 |------|--------|--------|
+| test_kernel_correctness | Correct output | ✅ PASS |
 | test_kernel_speedup | < 147,734 | ✅ PASS |
-| test_kernel_updated_starting_point | < 18,532 | ❌ FAIL (90k) |
+| **test_kernel_updated_starting_point** | **< 18,532** | ✅ **PASS** |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL |
+| test_opus45_casual | < 1,790 | ❌ FAIL |
+| test_opus45_2hr | < 1,579 | ❌ FAIL |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL |
+| test_opus45_11hr | < 1,487 | ❌ FAIL |
 | test_opus45_improved_harness | < 1,363 | ❌ FAIL |
+
+---
+
+## The Breakthrough: VALU Vectorization
+
+### What Made It Work
+
+1. **vload/vstore for consecutive data**: Load 8 indices/values at once
+2. **VALU for hash computation**: Compute hash for 8 items in parallel  
+3. **Batched address computation**: Compute all 8 node addresses in a single cycle using all 12 ALU slots
+4. **Batched loads**: Bundle load operations to use both load slots efficiently
+5. **Pre-allocated vector constants**: Broadcast constants to all 8 lanes once at startup
+
+### Cycle Breakdown per Batch (8 items)
+
+| Phase | Cycles | Notes |
+|-------|--------|-------|
+| vload indices | 1 | Load 8 consecutive indices |
+| vload values | 1 | Load 8 consecutive values |
+| Compute 8 addresses | 1 | Bundled in one add_vliw (uses 12 ALU slots) |
+| Load 8 node_vals | 4 | 2 loads/cycle, 4 cycles |
+| XOR (valu) | 1 | Vector XOR |
+| Hash (valu) | 12 | 6 stages × 2 cycles each |
+| idx computation | 5 | Vector bitwise + arithmetic |
+| vstore indices | 1 | Store 8 results |
+| vstore values | 1 | Store 8 results |
+| **Total** | **~27** | Per batch of 8 items |
+
+---
+
+## Key Learnings & Insights
+
+### Technical Insights
+
+1. **scratch_const() returns a scratch address**, not an immediate value
+2. **To use VALU properly**, must allocate VLEN consecutive scratch locations
+3. **Broadcast constants** by loading them into all VLEN lanes at startup
+4. **Bundle operations** using add_vliw to maximize parallelism
+5. **Use separate temporary addresses** for each of 8 parallel loads
+
+### Why Previous Vectorization Attempts Failed
+
+1. **Complex address computation**: Couldn't compute different addresses for each vector lane
+2. **Mixing vector/scalar operations**: Hard to get correct
+3. **ISA subtleties**: vbroadcast needed for scalar-vector mixing
+4. **Scratch space limits**: Running out of registers
+
+### The Solution
+
+The key insight was that while we can't vectorize the indirect addressing pattern directly, we CAN:
+1. Batch the address computation using all 12 ALU slots
+2. Use vload for the consecutive input arrays
+3. Use VALU for hash computation (since all 8 items compute hash simultaneously)
+4. Use vstore for consecutive output
+
+### Remaining Gap
+
+- **Current**: 18,090 cycles
+- **Hardest target**: < 1,363 cycles
+- **Gap**: Need ~13x more speedup
+- **Theoretical minimum**: ~1,536 cycles
+
+The hardest target (1,363) is below the theoretical minimum (~1,536), suggesting it may require a fundamentally different algorithm or additional optimizations not yet discovered.
+
+---
+
+## Optimization History
+
+| Attempt | Approach | Cycles | Status |
+|---------|----------|--------|--------|
+| Baseline | Original (no changes) | 147,734 | ✅ |
+| 5 | VLIW Packing | 123,158 | ✅ |
+| 7 | Address Pre-computation | 98,582 | ✅ |
+| 9 | vload for Round 0 | 97,910 | ⚠️ |
+| 14 | Pre-computed Addresses | 94,742 | ✅ |
+| 34 | Optimized idx formula | 90,646 | ✅ |
+| 41 | **VALU Vectorization** | **18,090** | ✅ **BREAKTHROUGH!** |
+
+---
+
+## 2026-03-13 (Attempt 41 - BREAKTHROUGH!)
+
+### Attempt 41: VALU Vectorization
+**Date**: 2026-03-13
+**Cycles**: 18,090
+**Status**: ✅ PASSES test_kernel_updated_starting_point!
+
+**Approach**:
+- Use vload to load 8 consecutive indices at once
+- Use vload to load 8 consecutive values at once
+- Compute all 8 node addresses in parallel (bundled into one add_vliw call)
+- Load 8 node_vals in batches (bundled load operations)
+- Use VALU engine for hash computation (parallel across 8 items)
+- Use VALU for idx computation (parallel across 8 items)
+- Use vstore to save 8 results at once
+
+**Key Insights**:
+1. **Bundled ALU ops**: All 8 address computations fit in one cycle (12 ALU slots available)
+2. **Bundled loads**: 2 load slots per cycle, so 4 cycles for 8 loads
+3. **VALU parallelism**: Hash computation runs on all 8 lanes simultaneously
+
+**Result**:
+- 90,646 → 18,090 cycles
+- **8.2x speedup over baseline!**
+- Passes test_kernel_updated_starting_point (< 18,532)!
+
+---
+
+## 2026-03-13 (Additional Analysis - Attempt 40)
+
+### Attempt 40: VALU for Hash (Failed)
+**Date**: 2026-03-13
+**Status**: ❌ Failed (correctness)
+
+**Approach**: Tried to use VALU engine for hash computation to reduce from 12 cycles to 6 cycles per item.
+
+**Problem**: VALU operations require VLEN=8 consecutive scratch locations (vector registers). Using vbroadcast on scalar scratch locations caused memory corruption.
+
+**Key Learning**: To use VALU properly, must restructure entire algorithm to process 8 items in parallel, allocating VLEN consecutive locations for each vector register.
+
+---
+
+## 2026-03-13 (Additional Analysis)
+
+### ISA Analysis Findings
+
+**Key Vector Instructions Found**:
+- `vbroadcast` - broadcast scalar to all VLEN lanes
+- `multiply_add` - vector multiply-add: `dest[i] = (a[i] * b[i] + c[i]) % 2^32`
+- `vselect` - vector conditional select
+- `vload`/`vstore` - contiguous vector loads/stores
+
+**Limitation Confirmed**: No gather/scatter for indirect addressing. Each vload loads from ONE base address but gives 8 consecutive values.
+
+### Alternative Algorithm Analysis
+
+**Processing Order Independence Verified**:
+- Confirmed that item-first and round-first produce identical results
+- Does not help vectorization directly
+
+**Tree Distribution Pattern Discovered**:
+- Round 0: All 256 items at idx=0 (perfect for vectorization!)
+- Round 1: 2 indices, max 134 items at same idx
+- Round 2: 4 indices, max 72 items
+- Round 6: 63 indices, max 8 items
+- Round 10: 224 indices, max 2 items
+- **Round 11: All items wrap back to idx=0!**
+- Pattern repeats every 11 rounds (tree depth = height + 1)
+
+**Theoretical Minimum Calculation**:
+- With perfect vectorization (8 items per vector): 512 vector iterations × 3 cycles = **1,536 cycles**
+- Target is 1,363 - extremely close!
+- This suggests a breakthrough approach exists
+
+### Attempt 39: Hybrid Vectorization
+**Date**: 2026-03-13
+**Cycles**: N/A
+**Status**: ❌ Failed (complexity/scratch limits)
+
+**Approach**:
+- Tried to vectorize using vload/vstore + valu for hash computation
+- Process 8 items at a time using vector operations
+- Issue: Each of 8 items still needs separate node_val lookup (indirect addressing)
+- Complexity and scratch limits prevented successful implementation
+
+**Key Insight**: The indirect addressing is the fundamental blocker. Even with vectorized hash, we can't vectorize the memory reads because each item reads from a different tree position.
+
+---
+
+## 2026-03-13 (Continued)
+
+### Attempt 37: Bit Operations Optimization
+**Date**: 2026-03-13
+**Cycles**: 90,646 (no improvement)
+**Status**: ✅ Working
+
+**Approach**:
+- Replaced `val % 2` with `val & 1` (bit operation)
+- Replaced `idx * 2` with `idx << 1` (left shift)
+- Expected to be faster but no cycle improvement
+
+**Result**: No change in performance - bit operations have same cost as arithmetic
+
+---
+
+### Attempt 38: Round 0 Vectorization
+**Date**: 2026-03-13
+**Cycles**: N/A
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- In Round 0, all 256 items start at idx=0, reading the SAME node_val
+- Attempted to use vload for batch loading 8 values at once
+- Used vbroadcast to share node_val across 8 vector lanes
+- Used valu engine for parallel hash computation
+- Used vstore for batch storing results
+
+**Problems encountered**:
+1. vload/vstore are LOAD/STORE engine ops, not VALU ops
+2. vload expects scratch address containing memory address
+3. Complex address computation required
+4. Correctness issues - results didn't match reference
+
+**Result**: Reverted to Attempt 34 (90,646 cycles)
+
+---
+
+### Key Learnings
+
+1. **ISA Complexity**: The vectorization requires understanding subtle ISA details:
+   - vload/vstore are in "load"/"store" engines, not "valu"
+   - vload takes a scratch address that contains the memory address to load from
+   - Mixing scalar and vector operations requires vbroadcast
+
+2. **Vectorization Blocked by Indirect Addressing**: The pattern `mem[forest_values_p + idx]` where idx varies per lane prevents efficient vectorization.
+
+3. **Processing Order Independence**: Verified that processing items in different orders (item-first vs round-first) produces same final result - but this doesn't help with vectorization.
 
 ---
 
@@ -791,6 +1002,66 @@ The theoretical minimum (~1,536 cycles) is VERY close to the target (1,363). Thi
 
 ---
 
+## Attempt 35: Round 0 Vectorization
+
+**Date**: 2026-03-13
+**Status**: ❌ Failed (correctness)
+
+**Approach**:
+- In Round 0, all 256 items start at idx=0
+- They all read forest_values[0] - the SAME node_val!
+- Attempted to use vload to load 8 consecutive values at once
+- Used vbroadcast to broadcast node_val to all 8 lanes
+- Used valu operations for parallel hash computation
+- Used vstore to save 8 results at once
+
+**Problems encountered**:
+1. vload is a LOAD operation, not VALU - had to fix that
+2. vstore is a STORE operation, not VALU - had to fix that
+3. Scalar constants don't work with valu operations - need vbroadcast
+4. Hash constants need to be broadcast to vector registers
+5. Final results incorrect - correctness issues with the vectorized approach
+
+**Key insight**:
+- The approach was conceptually correct but too complex to implement
+- The ISA has subtle requirements (broadcast for scalar-vector mixing)
+- Mixed vector/scalar operations are error-prone
+
+**Result**: Reverted to Attempt 34 (90,646 cycles)
+
+---
+
+## Attempt 36: Various experiments (no improvement)
+
+**Date**: 2026-03-13
+**Cycles**: 90,646 (same as Attempt 34)
+**Status**: ✅ Reverted to Attempt 34
+
+**Experiments tried**:
+
+1. **Full vectorization with vload/vstore**:
+   - Attempted to use vload to load 8 consecutive indices/values
+   - Used valu for parallel hash computation
+   - Used vstore to save 8 results
+   - **Result**: Failed with IndexError - the ISA doesn't support mixing vector loads with scalar address computation easily
+
+2. **Aggressive VLIW packing**:
+   - Tried to pack more independent ALU operations per cycle
+   - **Result**: No improvement - dependencies already limit parallelism
+
+3. **Node value caching**:
+   - Tried to cache frequently accessed node values in scratch
+   - **Result**: Made it worse (98,902 cycles) - cache overhead exceeded benefits
+
+**Key insight**:
+- The indirect addressing pattern `mem[forest_values_p + idx]` is the fundamental blocker
+- Cannot use vload for this because idx varies per item
+- All vectorization attempts fail due to this pattern
+- The theoretical minimum (~1,536 cycles) is very close to target (1,363)
+- But we can't achieve it without breaking through the indirect addressing barrier
+
+---
+
 ## Current Status
 
 **Cycles**: 90,646 (working best - Attempt 34)
@@ -824,6 +1095,7 @@ After extensive optimization attempts, we have achieved 90,646 cycles (1.63x spe
 3. **Optimized idx computation** - ✅ Working (90,646 cycles - NEW BEST)
 4. **Vectorization with valu** - ❌ Failed (correctness issues)
 5. **2-way loop unrolling** - ⚠️ No improvement
+6. **Round 0 vectorization** - ❌ Failed (correctness, ISA complexity)
 
 ### Conclusion
 

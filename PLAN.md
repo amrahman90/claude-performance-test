@@ -4,10 +4,40 @@
 
 This is Anthropic's Performance Engineering Take-Home Challenge. The goal is to optimize a simulated VLIW SIMD machine's kernel to minimize clock cycles.
 
-### Current Baseline
-- **Cycles**: 147,734 (scalar implementation, no parallelism)
-- **Target**: < 1,363 cycles (best human performance)
+### Current Status (BREAKTHROUGH ACHIEVED!)
+- **Cycles**: 18,090 (VALU vectorization approach)
+- **Speedup**: 8.2x over baseline
+- **Target**: < 1,363 cycles (hardest target)
 - **Test parameters**: forest_height=10, rounds=16, batch_size=256
+
+---
+
+## Key Breakthrough: VALU Vectorization
+
+The breakthrough was using the VALU (vector) engine to process 8 items in parallel:
+
+### What Made It Work
+
+1. **vload/vstore for consecutive data**: Load 8 indices/values at once
+2. **VALU for hash computation**: Compute hash for 8 items in parallel  
+3. **Batched address computation**: Compute all 8 node addresses in a single cycle using all 12 ALU slots
+4. **Batched loads**: Bundle load operations to use both load slots efficiently
+5. **Pre-allocated vector constants**: Broadcast constants to all 8 lanes once at startup
+
+### Cycle Breakdown per Batch (8 items)
+
+| Phase | Cycles | Notes |
+|-------|--------|-------|
+| vload indices | 1 | Load 8 consecutive indices |
+| vload values | 1 | Load 8 consecutive values |
+| Compute 8 addresses | 1 | Bundled in one add_vliw (uses 12 ALU slots) |
+| Load 8 node_vals | 4 | 2 loads/cycle, 4 cycles |
+| XOR (valu) | 1 | Vector XOR |
+| Hash (valu) | 12 | 6 stages × 2 cycles each |
+| idx computation | 5 | Vector bitwise + arithmetic |
+| vstore indices | 1 | Store 8 results |
+| vstore values | 1 | Store 8 results |
+| **Total** | **~27** | Per batch of 8 items |
 
 ---
 
@@ -38,11 +68,15 @@ This is Anthropic's Performance Engineering Take-Home Challenge. The goal is to 
 - **N_CORES** = 1 (single core)
 - **SCRATCH_SIZE** = 1536 (local register file)
 
-### Instruction Format
-Instructions are dictionaries with engine names as keys:
-```python
-{"valu": [("*", 4, 0, 0), ("+", 8, 4, 0)], "load": [("load", 16, 17)]}
-```
+### Key Vector Instructions Discovered
+
+| Instruction | Engine | Purpose |
+|------------|--------|---------|
+| vload | load | Load VLEN consecutive words from memory |
+| vstore | store | Store VLEN consecutive words to memory |
+| vbroadcast | valu | Broadcast scalar to all VLEN lanes |
+| vselect | flow | Vector conditional select |
+| valu ops | valu | Element-wise vector operations |
 
 ---
 
@@ -78,46 +112,66 @@ Each stage: `a = (op2(op1(a, val1)) ^ (op3(a, val3))) % 2^32`
 
 ---
 
-## Experiments & Findings
+## Submission Test Results
 
-### Attempt 1: Simple VLIW Packing
-- **Approach**: Pack multiple slots into same instruction
-- **Result**: Broke correctness - operations have dependencies within same batch item
-- **Issue**: Can't pack operations that depend on each other
+| Test | Target | Status | Cycles |
+|------|--------|--------|--------|
+| test_kernel_correctness | Correct output | ✅ PASS | - |
+| test_kernel_speedup | < 147,734 | ✅ PASS | 18,090 |
+| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 18,090 |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL | 18,090 |
+| test_opus45_casual | < 1,790 | ❌ FAIL | 18,090 |
+| test_opus45_2hr | < 1,579 | ❌ FAIL | 18,090 |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 18,090 |
+| test_opus45_11hr | < 1,487 | ❌ FAIL | 18,090 |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 18,090 |
 
-### Attempt 2: Vectorized Kernel
-- **Approach**: Use valu engine to process 8 items in parallel
-- **Result**: Incorrect results
-- **Issue**: Complex - can't easily compute different addresses for each vector lane using scratch constants
+**Achievement**: We've passed test_kernel_updated_starting_point! This was the main milestone.
 
-### Key Insights
+---
+
+## Optimization Journey
+
+### What Didn't Work (Key Learnings)
+
+| Attempt | Approach | Result | Learning |
+|---------|----------|--------|----------|
+| VLIW Packing | Group independent ops | ✅ 123k | Limited by dependencies |
+| Address Pre-computation | Pre-calc addresses | ✅ 98k | Saves 2 ALU ops/item |
+| Optimized idx formula | `idx*2 + 1 + (val%2)` | ✅ 90k | Current best scalar |
+| Vectorization (valu) - early | Process 8 items parallel | ❌ Failed | Complex address computation |
+| 2-way Loop Unrolling | Process 2 items/iter | ⚠️ No change | Dependencies prevent parallelism |
+| Software Pipelining | Overlap iterations | ❌ Failed | Correctness bugs |
+| Bit Operations | Replace `%2` with `&1` | ❌ No change | Hash is bottleneck |
+| vload for Round 0 | Vectorize first 8 items | ❌ Failed | Mixing vector/scalar issues |
+
+### What Finally Worked (Attempt 41)
+
+The key insight was that while we can't vectorize the indirect addressing pattern directly, we CAN:
+1. Batch the address computation using all 12 ALU slots
+2. Use vload for the consecutive input arrays
+3. Use VALU for hash computation (since all 8 items compute hash simultaneously)
+4. Use vstore for consecutive output
+
+### Key Technical Insights
+
 1. **scratch_const() returns a scratch address**, not an immediate value
-2. **ALU operations work on scratch addresses**, not immediate values
-3. **To use vectorization properly**, need to rethink address computation
-4. **Indirect indexing is hard with vectors** - each of 8 items has different index
+2. **To use VALU properly**, must allocate VLEN consecutive scratch locations
+3. **Broadcast constants** by loading them into all VLEN lanes at startup
+4. **Bundle operations** using add_vliw to maximize parallelism
+5. **Use separate temporary addresses** for each of 8 parallel loads
 
 ---
 
-## Current Status
-- Baseline: 147,734 cycles (working)
-- Attempted vectorization: Failed due to complexity of address computation
-- Next steps needed: Simpler optimizations
+## Theoretical Analysis
 
----
+- **Baseline**: 147,734 cycles
+- **Previous Best (scalar)**: 90,646 cycles (1.63x speedup)
+- **Current (VALU)**: 18,090 cycles (8.2x speedup)
+- **Target (hardest)**: < 1,363 cycles (need ~13x more)
+- **Theoretical Minimum**: ~1,536 cycles (with perfect 8-way vectorization)
 
-## Potential Optimization Approaches
-
-### Option 1: Loop Unrolling
-Unroll the inner loop to reduce loop overhead and enable better packing.
-
-### Option 2: Constant Pre-loading
-Move constant loads outside loops (already partially done).
-
-### Option 3: Smarter VLIW Packing
-Only pack operations from DIFFERENT iterations of the inner loop.
-
-### Option 4: Partial Vectorization
-Vectorize only the hash computation (which doesn't need indirect addressing).
+**Gap Analysis**: The hardest target (1,363) is below our theoretical minimum (~1,536), suggesting it may require a fundamentally different algorithm or additional optimizations not yet discovered.
 
 ---
 
@@ -132,25 +186,10 @@ python tests/submission_tests.py
 
 # Run with trace for debugging
 python perf_takehome.py Tests.test_kernel_trace
-# Then: python watch_trace.py
+
+# Run correctness tests only
+python -m pytest tests/submission_tests.py::CorrectnessTests -v
 ```
-
----
-
-## Current Status (Latest)
-- **Baseline**: 147,734 cycles
-- **Current Best**: 98,582 cycles
-- **Speedup**: 1.5x
-- **Target**: < 1,363 cycles
-- **Gap**: Need 72x more speedup
-
----
-
-## Key Learnings
-
-1. **VLIW packing helps but limited**: We can pack independent operations, but dependencies limit parallelism
-2. **Indirect addressing is the bottleneck**: The pattern `mem[forest_values_p + idx]` prevents full vectorization
-3. **Need valu engine to reach target**: Scalar optimization alone can't achieve 72x speedup
 
 ---
 
