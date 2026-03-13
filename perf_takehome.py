@@ -89,31 +89,21 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Attempt 52: VBroadcast + Memory Bundle Optimizations
+        Attempt 59: Multi-Round Processing (4 rounds at a time)
 
-        Key optimizations:
-        1. VBroadcast: Use vbroadcast to broadcast constants to vector registers
-           - Instead of 8 LOADs, use 1 vbroadcast
-           - Saves: ~100 cycles
+        Key insight: Process 4 rounds of computation WITHOUT storing intermediate results.
+        This eliminates 75% of memory traffic between rounds.
 
-        2. Bundle vloads: Use both LOAD slots in same cycle
-           - Before: 2 cycles (separate vload for indices and values)
-           - After: 1 cycle (bundled)
-           - Savings: 512 cycles
-
-        3. Bundle vstores: Use both STORE slots in same cycle
-           - Before: 2 cycles
-           - After: 1 cycle
-           - Savings: 512 cycles
-
-        Previous: 14,504 cycles
-        Current: 13,387 cycles (7.7% improvement!)
+        Previous: 12,620 cycles (2 rounds at a time)
+        Current: TBD
         """
         # === Allocate scratch ===
-        # Vector registers (VLEN=8 consecutive locations each)
-        vec_idx = self.alloc_scratch("vec_idx", VLEN)  # 8 idx values
-        vec_val = self.alloc_scratch("vec_val", VLEN)  # 8 val values
-        vec_node_val = self.alloc_scratch("vec_node_val", VLEN)  # 8 node_val values
+        # Vector registers
+        vec_idx = self.alloc_scratch("vec_idx", VLEN)  # current idx
+        vec_val = self.alloc_scratch("vec_val", VLEN)  # current val
+        vec_node_val = self.alloc_scratch("vec_node_val", VLEN)  # node value
+
+        # Temporary vectors (reuse for all rounds)
         vec_tmp1 = self.alloc_scratch("vec_tmp1", VLEN)
         vec_tmp2 = self.alloc_scratch("vec_tmp2", VLEN)
         vec_tmp3 = self.alloc_scratch("vec_tmp3", VLEN)
@@ -123,12 +113,8 @@ class KernelBuilder:
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
 
-        # Temporary addresses for node lookups (8 separate addresses)
+        # Temporary addresses for node lookups
         tmp_addrs = [self.alloc_scratch(f"tmp_addr_{i}") for i in range(VLEN)]
-
-        # Pre-allocate addresses for base
-        base_idx_addr = self.alloc_scratch("base_idx_addr")
-        base_val_addr = self.alloc_scratch("base_val_addr")
 
         # Scratch space for init vars
         init_vars = [
@@ -148,7 +134,6 @@ class KernelBuilder:
 
         # Pre-load constants
         zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
 
         # Pre-compute hash constants using VBROADCAST
         hash_consts_valu = []
@@ -161,37 +146,121 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", const3_base, const3_scalar))
             hash_consts_valu.append((const1_base, const3_base))
 
-        # Pre-allocate shift constant vector using vbroadcast
+        # Pre-allocate shift constant vector
         shift_const_base = self.alloc_scratch("shift_const", VLEN)
         shift_scalar = self.scratch_const(1)
         self.add("valu", ("vbroadcast", shift_const_base, shift_scalar))
 
-        # Pre-allocate zero vector using vbroadcast
+        # Pre-allocate zero vector
         zero_vec_base = self.alloc_scratch("zero_vec", VLEN)
         zero_scalar = self.scratch_const(0)
         self.add("valu", ("vbroadcast", zero_vec_base, zero_scalar))
 
-        # Pre-allocate n_nodes vector using vbroadcast
+        # Pre-allocate n_nodes vector
         n_nodes_base = self.alloc_scratch("n_nodes_vec", VLEN)
         n_nodes_scalar = self.scratch_const(n_nodes)
         self.add("valu", ("vbroadcast", n_nodes_base, n_nodes_scalar))
 
-        # Pre-compute ALL batch offsets once at startup
-        n_batches = batch_size // VLEN
+        # Pre-compute batch offsets
         batch_offsets = []
         for batch_start in range(0, batch_size, VLEN):
             batch_offsets.append(self.scratch_const(batch_start))
 
-        # Pre-compute addresses for first batch
-        self.add_vliw(
-            [
-                (
-                    "alu",
-                    ("+", base_idx_addr, self.scratch["inp_indices_p"], zero_const),
-                ),
-                ("alu", ("+", base_val_addr, self.scratch["inp_values_p"], zero_const)),
-            ]
-        )
+        # Helper function to process one round
+        def add_round_computation(round_num):
+            """Add computation for one round, reusing vec_tmp1/2/3 and tmp_addrs"""
+            # Phase 1: Compute node addresses
+            addr_compute = []
+            for i in range(VLEN):
+                addr_compute.append(
+                    (
+                        "alu",
+                        (
+                            "+",
+                            tmp_addrs[i],
+                            self.scratch["forest_values_p"],
+                            vec_idx + i,
+                        ),
+                    )
+                )
+            self.add_vliw(addr_compute)
+
+            # Phase 2: Load node vals
+            load_ops = []
+            for i in range(VLEN):
+                load_ops.append(("load", ("load", vec_node_val + i, tmp_addrs[i])))
+            for i in range(0, VLEN, 2):
+                self.add_vliw(load_ops[i : i + 2])
+
+            # XOR
+            self.add("valu", ("^", vec_val, vec_val, vec_node_val))
+
+            # Hash computation
+            for stage_idx, (c1_base, c3_base) in enumerate(hash_consts_valu):
+                op1, _, op2, op3, _ = HASH_STAGES[stage_idx]
+                self.add_vliw(
+                    [
+                        ("valu", (op1, vec_tmp1, vec_val, c1_base)),
+                        ("valu", (op3, vec_tmp2, vec_val, c3_base)),
+                    ]
+                )
+                self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
+
+            # Compute new idx
+            self.add_vliw(
+                [
+                    ("valu", ("<<", vec_tmp1, vec_idx, shift_const_base)),
+                    ("valu", ("&", vec_tmp2, vec_val, shift_const_base)),
+                ]
+            )
+            self.add_vliw(
+                [
+                    ("valu", ("+", vec_tmp3, vec_tmp2, shift_const_base)),
+                ]
+            )
+            self.add("valu", ("+", vec_idx, vec_tmp1, vec_tmp3))
+            self.add("valu", ("<", vec_tmp1, vec_idx, n_nodes_base))
+            self.add("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, zero_vec_base))
+
+        # Process all rounds at once (16 rounds) - maximum optimization
+        # Each batch processes all 16 rounds without any intermediate stores
+        for batch_offset in batch_offsets:
+            # Compute base addresses
+            self.add_vliw(
+                [
+                    (
+                        "alu",
+                        ("+", tmp1, self.scratch["inp_indices_p"], batch_offset),
+                    ),
+                    (
+                        "alu",
+                        ("+", tmp2, self.scratch["inp_values_p"], batch_offset),
+                    ),
+                ]
+            )
+
+            # Initial load
+            self.add_vliw(
+                [
+                    ("load", ("vload", vec_idx, tmp1)),
+                    ("load", ("vload", vec_val, tmp2)),
+                ]
+            )
+
+            # Process ALL rounds
+            for _ in range(rounds):
+                add_round_computation(0)
+
+            # Store final results
+            self.add_vliw(
+                [
+                    ("store", ("vstore", tmp1, vec_idx)),
+                    ("store", ("vstore", tmp2, vec_val)),
+                ]
+            )
+
+        # Add halt
+        self.add("flow", ("halt",))
 
         # Process all rounds - fully unrolled
         for _ in range(rounds):

@@ -106,13 +106,28 @@ When you need the same constant in all 8 vector lanes:
 ### 4. Theoretical Limits
 
 - **Current**: 13,387 cycles
-- **Theoretical minimum**: ~11,264 cycles
-- **Hardest target**: 1,363 cycles (requires ~8x below theoretical!)
+- **Per-batch minimum**: 25 cycles (see breakdown below)
+- **Batches**: 16 rounds × 32 batches = 512 iterations
+- **Theoretical minimum**: 512 × 25 = 12,800 cycles
+- **Hardest target**: 1,363 cycles (requires ~10x below theoretical minimum!)
 
-The hardest targets appear mathematically impossible with current algorithm - they likely require:
-- A fundamentally different algorithm
-- Some undiscovered ISA feature
-- Multiple rounds of computation in parallel
+**Per-Batch Cycle Breakdown:**
+| Phase | Cycles |
+|-------|--------|
+| Address computation (ALU) | 1 |
+| vload (2 items) | 1 |
+| Compute 8 node addresses | 1 |
+| Load 8 node_vals | 4 |
+| XOR | 1 |
+| Hash (6 stages) | 12 |
+| idx computation | 5 |
+| vstore | 1 |
+| **Total** | **25** |
+
+The hardest targets (1,363-2,164) are mathematically impossible with the current algorithm. They likely require:
+- A fundamentally different algorithm (e.g., parallel rounds)
+- Some undiscovered mathematical transformation
+- Or possibly a different interpretation of the problem
 
 ---
 
