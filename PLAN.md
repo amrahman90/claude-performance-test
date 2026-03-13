@@ -5,8 +5,8 @@
 This is Anthropic's Performance Engineering Take-Home Challenge. The goal is to optimize a simulated VLIW SIMD machine's kernel to minimize clock cycles.
 
 ### Current Status (BREAKTHROUGH ACHIEVED!)
-- **Cycles**: 18,090 (VALU vectorization approach)
-- **Speedup**: 8.2x over baseline
+- **Cycles**: 14,504 (VALU vectorization approach - Attempt 50)
+- **Speedup**: 10.2x over baseline
 - **Target**: < 1,363 cycles (hardest target)
 - **Test parameters**: forest_height=10, rounds=16, batch_size=256
 
@@ -23,6 +23,7 @@ The breakthrough was using the VALU (vector) engine to process 8 items in parall
 3. **Batched address computation**: Compute all 8 node addresses in a single cycle using all 12 ALU slots
 4. **Batched loads**: Bundle load operations to use both load slots efficiently
 5. **Pre-allocated vector constants**: Broadcast constants to all 8 lanes once at startup
+6. **Bundle VALU ops**: Use add_vliw to pack multiple VALU ops in same cycle (key optimization!)
 
 ### Cycle Breakdown per Batch (8 items)
 
@@ -38,6 +39,33 @@ The breakthrough was using the VALU (vector) engine to process 8 items in parall
 | vstore indices | 1 | Store 8 results |
 | vstore values | 1 | Store 8 results |
 | **Total** | **~27** | Per batch of 8 items |
+
+---
+
+## Latest Discoveries (Attempt 50)
+
+### VALU Bundling Discovery
+- **Discovery**: Using add_vliw() to bundle multiple VALU ops in same cycle
+- **Key insight**: The add() method creates separate instructions, add_vliw() bundles them
+- **Implementation**: Bundle op1 + op3 for each hash stage, and idx << + idx & operations
+- **Savings**: 3,584 cycles (20% improvement!)
+
+### Pause Instruction Analysis
+- **Discovery**: Test harness sets `machine.enable_pause = False`
+- **Finding**: Pauses don't pause execution but still count as cycles
+- **Action**: Removed unnecessary pause instructions
+- **Savings**: 2 cycles (minimal compared to VALU bundling)
+
+### Instruction Breakdown Analysis
+- Total instructions: 18,088 (equals cycle count)
+- load: 3239, alu: 1025, valu: 12288, flow: 512, store: 1024
+- 512 flow = vselect operations (1 per batch)
+- No pause instructions in current kernel (removed)
+
+### Hash Optimization Analysis
+- 6 stages × 2 cycles = 12 cycles per batch minimum
+- Cannot reduce further due to dependencies: each stage uses result of previous
+- multiply_add doesn't help for this algorithm
 
 ---
 
@@ -117,16 +145,16 @@ Each stage: `a = (op2(op1(a, val1)) ^ (op3(a, val3))) % 2^32`
 | Test | Target | Status | Cycles |
 |------|--------|--------|--------|
 | test_kernel_correctness | Correct output | ✅ PASS | - |
-| test_kernel_speedup | < 147,734 | ✅ PASS | 18,090 |
-| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 18,090 |
-| test_opus4_many_hours | < 2,164 | ❌ FAIL | 18,090 |
-| test_opus45_casual | < 1,790 | ❌ FAIL | 18,090 |
-| test_opus45_2hr | < 1,579 | ❌ FAIL | 18,090 |
-| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 18,090 |
-| test_opus45_11hr | < 1,487 | ❌ FAIL | 18,090 |
-| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 18,090 |
+| test_kernel_speedup | < 147,734 | ✅ PASS | 14,504 |
+| test_kernel_updated_starting_point | < 18,532 | ✅ PASS | 14,504 |
+| test_opus4_many_hours | < 2,164 | ❌ FAIL | 14,504 |
+| test_opus45_casual | < 1,790 | ❌ FAIL | 14,504 |
+| test_opus45_2hr | < 1,579 | ❌ FAIL | 14,504 |
+| test_sonnet45_many_hours | < 1,548 | ❌ FAIL | 14,504 |
+| test_opus45_11hr | < 1,487 | ❌ FAIL | 14,504 |
+| test_opus45_improved_harness | < 1,363 | ❌ FAIL | 14,504 |
 
-**Achievement**: We've passed test_kernel_updated_starting_point! This was the main milestone.
+**Achievement**: We've passed test_kernel_updated_starting_point with 10.2x speedup! This was the main milestone.
 
 ---
 
@@ -167,13 +195,14 @@ The key insight was that while we can't vectorize the indirect addressing patter
 
 - **Baseline**: 147,734 cycles
 - **Previous Best (scalar)**: 90,646 cycles (1.63x speedup)
-- **Current (VALU)**: 18,090 cycles (8.2x speedup)
-- **Target (hardest)**: < 1,363 cycles (need ~13x more)
-- **Theoretical Minimum**: ~1,536 cycles (with perfect 8-way vectorization)
+- **VALU Vectorization**: 18,088 cycles (8.2x speedup)
+- **Current (Bundled VALU)**: 14,504 cycles (10.2x speedup)
+- **Target (hardest)**: < 1,363 cycles (need ~10x more)
+- **Theoretical Minimum**: ~11,264 cycles (hash + memory + overhead with perfect bundling)
 
-**Key Finding**: The hardest target (1,363) is BELOW our theoretical minimum (~1,536), suggesting it may require a fundamentally different algorithm or additional optimizations not yet discovered.
+**Key Finding**: The hardest target (1,363) is still below our theoretical minimum (~11,264), suggesting it requires a fundamentally different algorithm or additional optimizations not yet discovered.
 
-**Note**: Attempts 42-43 to further optimize (parallel idx computation, pre-computed batch offsets) did not improve the cycle count. The bottleneck is primarily the hash computation (12 cycles per batch minimum).
+**Note**: Attempt 50's VALU bundling was a major breakthrough, reducing cycles by 20% (3,584 cycles saved).
 
 ---
 
