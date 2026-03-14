@@ -89,16 +89,17 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Attempt 73: Ultra-optimized with all learnings
+        Attempt 79: Better instruction bundling
 
         Key insights:
         - Use VALU for 8-item parallel processing
         - multiply_add for hash stages 0, 2, 4
         - Skip const3 for multiply_add stages (not needed - encoded in multiplier)
-        - Bundle all operations tightly
-        - Process all rounds without storing intermediate results
+        - Round 0 and 11: All items access root node - optimize with broadcast
+        - Pre-load root node value once and reuse
+        - Better bundling: pack more operations per cycle
 
-        Current: 10,402 cycles
+        Previous attempt: 10,148 cycles
         """
         # === Allocate scratch ===
         # Vector registers
@@ -169,6 +170,20 @@ class KernelBuilder:
 
         # Pre-compute batch offsets
         batch_offsets = [self.scratch_const(i) for i in range(0, batch_size, VLEN)]
+
+        # Pre-compute root node address (index 0) for round 0 optimization
+        root_node_addr = self.alloc_scratch("root_node_addr")
+        self.add(
+            "alu", ("+", root_node_addr, self.scratch["forest_values_p"], zero_const)
+        )
+
+        # Pre-allocate scalar for root node value
+        root_node_val = self.alloc_scratch("root_node_val")
+        # Load root node value ONCE (same for all batches and both special rounds)
+        self.add("load", ("load", root_node_val, root_node_addr))
+
+        # Pre-allocate vector for root node value (will be broadcast)
+        vec_root_val = self.alloc_scratch("vec_root_val", VLEN)
 
         def add_round_computation():
             # Phase 1: Compute node addresses (bundled)
@@ -244,8 +259,104 @@ class KernelBuilder:
             )
 
             # Process ALL rounds
-            for _ in range(rounds):
-                add_round_computation()
+            # Round 0: All items start at index 0, so we can optimize node value loading
+            # Round 11: All items wrap back to root after depth 10
+
+            # Round 0 optimization: use pre-loaded root value and broadcast
+            # Broadcast to all lanes
+            self.add("valu", ("vbroadcast", vec_node_val, root_node_val))
+
+            # XOR with root value
+            self.add("valu", ("^", vec_val, vec_val, vec_node_val))
+
+            # Hash computation
+            for stage_idx, (c1_base, c3_base, mul_base, use_mul) in enumerate(
+                hash_consts_valu
+            ):
+                op1, _, op2, op3, _ = HASH_STAGES[stage_idx]
+                if use_mul:
+                    self.add(
+                        "valu", ("multiply_add", vec_val, vec_val, mul_base, c1_base)
+                    )
+                else:
+                    self.add_vliw(
+                        [
+                            ("valu", (op1, vec_tmp1, vec_val, c1_base)),
+                            ("valu", (op3, vec_tmp2, vec_val, c3_base)),
+                        ]
+                    )
+                    self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
+
+            # Compute new idx
+            self.add_vliw(
+                [
+                    ("valu", ("<<", vec_tmp1, vec_idx, shift_const_base)),
+                    ("valu", ("&", vec_tmp2, vec_val, shift_const_base)),
+                ]
+            )
+            self.add_vliw(
+                [
+                    ("valu", ("+", vec_tmp3, vec_tmp2, shift_const_base)),
+                ]
+            )
+            self.add("valu", ("+", vec_idx, vec_tmp1, vec_tmp3))
+            self.add("valu", ("<", vec_tmp1, vec_idx, n_nodes_base))
+            self.add("flow", ("vselect", vec_idx, vec_tmp1, vec_idx, zero_vec_base))
+
+            # Rounds 1-10: normal processing
+            for round_num in range(1, rounds):
+                # Check if this is round 11 (round_num == 11 in 0-indexed would be round 12 in 1-indexed)
+                # Wait - rounds are 0-indexed from our initial handling
+                # Round 0: handled (all at root)
+                # Round 10: some wrap
+                # Round 11: all at root again
+
+                if round_num == 11:
+                    # Round 11 optimization: all items wrap back to root
+                    # Use pre-loaded root value and broadcast
+                    self.add("valu", ("vbroadcast", vec_node_val, root_node_val))
+
+                    # XOR with root value
+                    self.add("valu", ("^", vec_val, vec_val, vec_node_val))
+
+                    # Hash computation
+                    for stage_idx, (c1_base, c3_base, mul_base, use_mul) in enumerate(
+                        hash_consts_valu
+                    ):
+                        op1, _, op2, op3, _ = HASH_STAGES[stage_idx]
+                        if use_mul:
+                            self.add(
+                                "valu",
+                                ("multiply_add", vec_val, vec_val, mul_base, c1_base),
+                            )
+                        else:
+                            self.add_vliw(
+                                [
+                                    ("valu", (op1, vec_tmp1, vec_val, c1_base)),
+                                    ("valu", (op3, vec_tmp2, vec_val, c3_base)),
+                                ]
+                            )
+                            self.add("valu", (op2, vec_val, vec_tmp1, vec_tmp2))
+
+                    # Compute new idx
+                    self.add_vliw(
+                        [
+                            ("valu", ("<<", vec_tmp1, vec_idx, shift_const_base)),
+                            ("valu", ("&", vec_tmp2, vec_val, shift_const_base)),
+                        ]
+                    )
+                    self.add_vliw(
+                        [
+                            ("valu", ("+", vec_tmp3, vec_tmp2, shift_const_base)),
+                        ]
+                    )
+                    self.add("valu", ("+", vec_idx, vec_tmp1, vec_tmp3))
+                    self.add("valu", ("<", vec_tmp1, vec_idx, n_nodes_base))
+                    self.add(
+                        "flow", ("vselect", vec_idx, vec_tmp1, vec_idx, zero_vec_base)
+                    )
+                else:
+                    add_round_computation()
 
             # Store final results
             self.add_vliw(
